@@ -67,7 +67,7 @@ ONNX_OPERATOR_TYPED_KERNEL_EX(
         .TypeConstraint("T3", DataTypeImpl::GetTensorType<int8_t>()),
     QLinearMatMul);
 
-// uint16_t kernel supports QUInt16 activations × QUInt8 weights
+// uint16_t kernel supports QUInt16 activations × QUInt16 weights
 ONNX_OPERATOR_VERSIONED_TYPED_KERNEL_EX(
     QLinearMatMul,
     kOnnxDomain,
@@ -77,7 +77,7 @@ ONNX_OPERATOR_VERSIONED_TYPED_KERNEL_EX(
     kCpuExecutionProvider,
     KernelDefBuilder()
         .TypeConstraint("T1", DataTypeImpl::GetTensorType<uint16_t>())
-        .TypeConstraint("T2", DataTypeImpl::GetTensorType<uint8_t>())
+        .TypeConstraint("T2", {DataTypeImpl::GetTensorType<uint16_t>(), DataTypeImpl::GetTensorType<uint8_t>()})
         .TypeConstraint("T3", DataTypeImpl::GetTensorType<uint16_t>()),
     QLinearMatMul);
 
@@ -90,7 +90,7 @@ ONNX_OPERATOR_TYPED_KERNEL_EX(
     KernelDefBuilder()
         .TypeConstraint("TS", DataTypeImpl::GetTensorType<float>())
         .TypeConstraint("T1", DataTypeImpl::GetTensorType<uint16_t>())
-        .TypeConstraint("T2", DataTypeImpl::GetTensorType<uint8_t>())
+        .TypeConstraint("T2", {DataTypeImpl::GetTensorType<uint16_t>(), DataTypeImpl::GetTensorType<uint8_t>()})
         .TypeConstraint("T3", DataTypeImpl::GetTensorType<uint16_t>()),
     QLinearMatMul);
 

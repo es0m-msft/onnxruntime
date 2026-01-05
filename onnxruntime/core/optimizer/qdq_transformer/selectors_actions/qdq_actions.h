@@ -59,6 +59,13 @@ struct BinaryReplaceWithQLinear : ReplaceWithQLinear {
   BinaryReplaceWithQLinear(std::string domain);
 };
 
+struct MatMulReplaceWithQLinearDomainAware : ReplaceWithQLinear {
+  MatMulReplaceWithQLinearDomainAware();
+
+ private:
+  std::string Domain(const RuntimeState& state) const override;
+};
+
 struct VariadicReplaceWithQLinear : ReplaceWithQLinear {
   VariadicReplaceWithQLinear(std::string domain);
 };
@@ -80,7 +87,7 @@ struct MatMulReplaceWithQLinear : public Action {
 
  private:
   QDQReplaceWithNew matmul_int_to_float_replacer_;
-  BinaryReplaceWithQLinear qlinear_matmul_replacer_;
+  MatMulReplaceWithQLinearDomainAware qlinear_matmul_replacer_;
 };
 
 // used together with DQMatMulNodeGroupSelector, which does the sanity check

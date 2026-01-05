@@ -248,6 +248,15 @@ VariadicReplaceWithQLinear::VariadicReplaceWithQLinear(std::string domain)
     : ReplaceWithQLinear(std::move(domain), VariadicMoves()) {
 }
 
+MatMulReplaceWithQLinearDomainAware::MatMulReplaceWithQLinearDomainAware()
+    : ReplaceWithQLinear(kOnnxDomain, BinaryMoves()) {
+}
+
+std::string MatMulReplaceWithQLinearDomainAware::Domain(const RuntimeState& /*state*/) const {
+  // Always use ONNX domain for QLinearMatMul (uint8/int8/uint16)
+  return kOnnxDomain;
+}
+
 ConvReplaceWithQLinear::ConvReplaceWithQLinear()
     : ReplaceWithQLinear(kOnnxDomain, ConvMoves()) {
 }
@@ -256,7 +265,7 @@ WhereReplaceWithQLinear::WhereReplaceWithQLinear()
 }
 MatMulReplaceWithQLinear::MatMulReplaceWithQLinear()
     : matmul_int_to_float_replacer_{MatMulIntToFloatReplacer()},
-      qlinear_matmul_replacer_{kOnnxDomain} {
+      qlinear_matmul_replacer_{} {
 }
 
 Status SplitReplaceWithQuant::Run(Graph& graph, const NodesToOptimize& selected_nodes) const {

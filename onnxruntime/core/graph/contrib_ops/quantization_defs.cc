@@ -1530,5 +1530,40 @@ output_shape can also be explicitly specified in which case pads values are auto
           // convTransposeShapeInference(ctx, input_remap);
         }));
 
+// Custom QLinearMatMul schema to support uint16 activations × uint8 weights
+// Registered in the MS domain to extend ONNX QLinearMatMul with uint16 support without conflicts
+static const char* QLinearMatMul_uint16_doc = R"DOC(
+QLinearMatMul with extended type support for uint16 activations.
+Matrix product that behaves like numpy.matmul: https://docs.scipy.org/doc/numpy/reference/generated/numpy.matmul.html.
+The production MUST never overflow. The accumulation may overflow if and only if in 32 bits.
+Supports uint16 activations × uint8 weights → uint16 output on ARM64.
+)DOC";
+
+ONNX_MS_OPERATOR_SET_SCHEMA(
+    QLinearMatMul, 1,
+    OpSchema()
+        .SetDoc(QLinearMatMul_uint16_doc)
+        .Input(0, "a", "N-dimensional quantized matrix a", "T1")
+        .Input(1, "a_scale", "scale of quantized input a", "tensor(float)")
+        .Input(2, "a_zero_point", "zero point of quantized input a", "T1")
+        .Input(3, "b", "N-dimensional quantized matrix b", "T2")
+        .Input(4, "b_scale", "scale of quantized input b", "tensor(float)")
+        .Input(5, "b_zero_point", "zero point of quantized input b", "T2")
+        .Input(6, "y_scale", "scale of quantized output y", "tensor(float)")
+        .Input(7, "y_zero_point", "zero point of quantized output y", "T3")
+        .Output(0, "y", "Quantized matrix multiply results from a * b", "T3")
+        .TypeConstraint("T1", {"tensor(uint8)", "tensor(int8)", "tensor(uint16)"},
+                        "Constrain input a and its zero point data type as 8-bit or 16-bit integer tensor.")
+        .TypeConstraint("T2", {"tensor(uint8)", "tensor(int8)"},
+                        "Constrain input b and its zero point data type as 8-bit integer tensor.")
+        .TypeConstraint("T3", {"tensor(uint8)", "tensor(int8)", "tensor(uint16)"},
+                        "Constrain output y and its zero point data type as 8-bit or 16-bit integer tensor.")
+        .TypeAndShapeInferenceFunction([](ONNX_NAMESPACE::InferenceContext& ctx) {
+          propagateElemTypeFromInputToOutput(ctx, 0, 0);
+          if (!hasInputShape(ctx, 0) || !hasInputShape(ctx, 3))
+            return;
+          ONNX_NAMESPACE::defs::math::utils::MatMulShapeInference(ctx, 0, 3);
+        }));
+
 }  // namespace contrib
 }  // namespace onnxruntime

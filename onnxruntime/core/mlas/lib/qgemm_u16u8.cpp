@@ -121,31 +121,41 @@ Return Value:
         std::vector<int32_t> ColumnSumBuffer(StrideN);
         std::vector<int32_t> ZeroPointBBuffer(StrideN);
 
+        // PERFORMANCE FIX: Pre-compute ALL row sums once (was being recomputed for every column tile)
+        std::vector<int32_t> AllRowSums(M);
+        for (size_t m = 0; m < M; m++) {
+            int32_t row_sum = 0;
+            for (size_t k = 0; k < K; k++) {
+                row_sum += static_cast<int32_t>(A[m * lda + k]);
+            }
+            AllRowSums[m] = row_sum;
+        }
+
+        // PERFORMANCE FIX: Pre-compute ALL column sums once (was being recomputed for every row tile)
+        std::vector<int32_t> AllColumnSums(N);
+        for (size_t n = 0; n < N; n++) {
+            int32_t col_sum = 0;
+            for (size_t k = 0; k < K; k++) {
+                col_sum += static_cast<int32_t>(B[k * ldb + n]);
+            }
+            AllColumnSums[n] = col_sum;
+        }
+
         // Process in tiles
         for (size_t m = 0; m < M; m += StrideM) {
             const size_t CountM = std::min(M - m, StrideM);
 
-            // Compute row sums: sum of each row of A
-            std::fill(RowSumBuffer.begin(), RowSumBuffer.end(), 0);
+            // Copy pre-computed row sums for this tile
             for (size_t mm = 0; mm < CountM; mm++) {
-                int32_t row_sum = 0;
-                for (size_t k = 0; k < K; k++) {
-                    row_sum += static_cast<int32_t>(A[(m + mm) * lda + k]);
-                }
-                RowSumBuffer[mm] = row_sum;
+                RowSumBuffer[mm] = AllRowSums[m + mm];
             }
 
             for (size_t n = 0; n < N; n += StrideN) {
                 const size_t CountN = std::min(N - n, StrideN);
 
-                // Compute column sums: sum of each column of B
-                std::fill(ColumnSumBuffer.begin(), ColumnSumBuffer.end(), 0);
+                // Copy pre-computed column sums for this tile
                 for (size_t nn = 0; nn < CountN; nn++) {
-                    int32_t col_sum = 0;
-                    for (size_t k = 0; k < K; k++) {
-                        col_sum += static_cast<int32_t>(B[k * ldb + n + nn]);
-                    }
-                    ColumnSumBuffer[nn] = col_sum;
+                    ColumnSumBuffer[nn] = AllColumnSums[n + nn];
                 }
 
                 // Setup zero point B buffer

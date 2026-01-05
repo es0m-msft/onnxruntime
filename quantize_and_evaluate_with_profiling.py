@@ -492,6 +492,11 @@ def main():
     qint8_perchan_config["per_channel"] = True
     all_configs["qint8_perchan"] = qint8_perchan_config
 
+    # QUInt16 configuration (unsigned 16-bit activation, typically with QUInt8 weights)
+    quint16_config = base_config.copy()
+    quint16_config["activation_type"] = "QUInt16"
+    all_configs["quint16"] = quint16_config
+
     # QInt16 configuration (only change activation type to signed int16)
     qint16_config = base_config.copy()
     qint16_config["activation_type"] = "QInt16"

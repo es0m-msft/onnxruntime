@@ -8,11 +8,27 @@
 
 ## Building ONNX Runtime ARM64 with QUInt16×QUInt8 Support
 
-### Build Command
+### Full Build Command (Initial Build)
 ```powershell
 cd ${ORTSOURCEDIR}
 python tools/ci_build/build.py --config Release --build_dir build_arm64_u16u8 --arm64 --build_wheel --parallel --skip_tests
 ```
+
+### Incremental Build Commands (After Initial Build)
+
+**1. Rebuild C++ only (after code changes):**
+```powershell
+cd ${ORTSOURCEDIR}\build_arm64_u16u8\Release
+cmake --build . --config Release --parallel
+```
+This recompiles only changed C++ files without regenerating CMake cache. Much faster for iterative development.
+
+**2. Rebuild Python wheel only (from latest build):**
+```powershell
+cd ${ORTSOURCEDIR}\build_arm64_u16u8\Release\Release
+python ../../../setup.py bdist_wheel
+```
+This regenerates the wheel from current compiled binaries without recompiling C++ code. The wheel will be created in `dist\onnxruntime-1.24.0-cp312-cp312-win_arm64.whl` (relative to the current directory).
 
 ### Build Artifacts
 - Wheel location: `${ORTSOURCEDIR}\build_arm64_u16u8\Release\Release\dist\onnxruntime-1.24.0-cp312-cp312-win_arm64.whl`
@@ -254,3 +270,24 @@ python test_simple.py  # Uses ORT_DISABLE_ALL
 ### Key Insight
 
 The kernel implementation is **100% complete and working**. The only blocker is a schema validation check that happens *before* the kernel is ever invoked. Once we register a custom schema that allows uint16 for QLinearMatMul, the entire integration will work end-to-end and deliver the expected ~5-6x performance improvement.
+
+## Latest Investigation (2026-01-05)
+
+### Schema Patching Status
+✓ ONNX QLinearMatMul opset 21 - Added uint16 to T1, T2, T3
+✓ ONNX QLinearMatMul opset 10 (old.cc) - Added uint16 to T1, T2, T3
+✓ ONNX QuantizeLinear opset 13 (old.cc) - Added uint16 to T2
+✓ ONNX DequantizeLinear opset 13 (old.cc) - Added uint16 to T
+✓ MS domain QuantizeLinear opset 1 - ALREADY has uint16 support
+✓ MS domain DequantizeLinear opset 1 - ALREADY has uint16 support
+
+### Remaining Error
+Despite all schemas supporting uint16, still getting:
+```
+Type 'tensor(uint16)' of input parameter (/lang_encoder/embeddings/LayerNorm/Add_1_output_0_QuantizeLinear_Output) of operator...
+```
+
+The error message is incomplete - it doesn't say WHICH operator is rejecting the uint16 input.
+
+### Next Steps
+Need to investigate what OTHER operators in the fusion pattern might be rejecting uint16 types. The error occurs during graph optimization, suggesting an intermediate operator (not Q/DQ/QLinearMatMul) doesn't support uint16.
