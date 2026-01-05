@@ -636,6 +636,57 @@ MlasGemm(
 }
 
 /**
+ * @brief Structure for QUInt16 x QUInt8 quantized GEMM data parameters.
+ *
+ * This structure provides the memory pointers and strides for QUInt16 activations
+ * and QUInt8 weights in a quantized GEMM operation.
+ */
+struct MLAS_GEMM_U16U8_DATA_PARAMS {
+    const uint16_t* A = nullptr;         /**< Pointer to uint16_t activation matrix A */
+    size_t lda = 0;                      /**< Row stride of matrix A */
+    uint16_t ZeroPointA = 0;             /**< Zero point for matrix A */
+    const uint8_t* B = nullptr;          /**< Pointer to uint8_t weight matrix B */
+    size_t ldb = 0;                      /**< Row stride of matrix B */
+    const uint8_t* ZeroPointB = nullptr; /**< Zero point(s) for matrix B (scalar or per-column) */
+    bool PerColumnZeroPoints = false;    /**< True if B has per-column zero points */
+    bool BIsPacked = false;              /**< True if B is pre-packed */
+    int32_t* C = nullptr;                /**< Pointer to int32_t output matrix C */
+    size_t ldc = 0;                      /**< Row stride of matrix C */
+    MLAS_QGEMM_OUTPUT_PROCESSOR* OutputProcessor = nullptr; /**< Optional output post-processor */
+};
+
+/**
+ * @brief Batched quantized GEMM for QUInt16 activations x QUInt8 weights.
+ *
+ * This routine performs quantized matrix multiplication where matrix A uses
+ * QUInt16 (16-bit unsigned integer) and matrix B uses QUInt8 (8-bit unsigned integer).
+ * The output is int32_t accumulation.
+ *
+ * @param [IN]  Shape        Shape descriptor (M, N, K dimensions)
+ * @param [IN]  DataParams   Array of data descriptors
+ * @param [IN]  BatchN       Number of multiplications to perform
+ * @param [IN]  ThreadPool   Optional thread pool for parallel processing
+ */
+void
+MLASCALL
+MlasGemmU16U8Batch(
+    const MLAS_GEMM_QUANT_SHAPE_PARAMS& Shape,
+    const MLAS_GEMM_U16U8_DATA_PARAMS* DataParams,
+    const size_t BatchN,
+    MLAS_THREADPOOL* ThreadPool
+    );
+
+inline
+void
+MlasGemmU16U8(
+    const MLAS_GEMM_QUANT_SHAPE_PARAMS& Shape,
+    const MLAS_GEMM_U16U8_DATA_PARAMS& DataParams,
+    MLAS_THREADPOOL* ThreadPool)
+{
+    MlasGemmU16U8Batch(Shape, &DataParams, 1, ThreadPool);
+}
+
+/**
  * @brief Parameters that define the shape of a dynamically quantized GEMM operation.
  *
  * The structure holds the dimensions of the matrices involved in the GEMM

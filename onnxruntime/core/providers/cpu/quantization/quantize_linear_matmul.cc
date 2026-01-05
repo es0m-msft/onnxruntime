@@ -67,9 +67,39 @@ ONNX_OPERATOR_TYPED_KERNEL_EX(
         .TypeConstraint("T3", DataTypeImpl::GetTensorType<int8_t>()),
     QLinearMatMul);
 
+// uint16_t kernel supports QUInt16 activations × QUInt8 weights
+ONNX_OPERATOR_VERSIONED_TYPED_KERNEL_EX(
+    QLinearMatMul,
+    kOnnxDomain,
+    10,
+    20,
+    uint16_t,
+    kCpuExecutionProvider,
+    KernelDefBuilder()
+        .TypeConstraint("T1", DataTypeImpl::GetTensorType<uint16_t>())
+        .TypeConstraint("T2", DataTypeImpl::GetTensorType<uint8_t>())
+        .TypeConstraint("T3", DataTypeImpl::GetTensorType<uint16_t>()),
+    QLinearMatMul);
+
+ONNX_OPERATOR_TYPED_KERNEL_EX(
+    QLinearMatMul,
+    kOnnxDomain,
+    21,
+    uint16_t,
+    kCpuExecutionProvider,
+    KernelDefBuilder()
+        .TypeConstraint("TS", DataTypeImpl::GetTensorType<float>())
+        .TypeConstraint("T1", DataTypeImpl::GetTensorType<uint16_t>())
+        .TypeConstraint("T2", DataTypeImpl::GetTensorType<uint8_t>())
+        .TypeConstraint("T3", DataTypeImpl::GetTensorType<uint16_t>()),
+    QLinearMatMul);
+
 Status QLinearMatMul::Compute(OpKernelContext* ctx) const {
   const auto* a = ctx->Input<Tensor>(IN_A);
   const auto* b = packed_b_ ? nullptr : ctx->Input<Tensor>(IN_B);
+
+  // Check if this is QUInt16 × QUInt8 mixed precision case
+  bool is_u16u8 = a->IsDataType<uint16_t>();
 
   // validate offsets
   const auto* a_offset = ctx->Input<Tensor>(IN_A_ZERO_POINT);
@@ -93,6 +123,86 @@ Status QLinearMatMul::Compute(OpKernelContext* ctx) const {
   ORT_ENFORCE(IsScalarOr1ElementVector(y_scale),
               "QLinearMatmul : result scale must be a scalar or 1D tensor of size 1");
 
+  // Handle QUInt16 × QUInt8 mixed precision separately
+  if (is_u16u8) {
+#if defined(MLAS_TARGET_ARM64) || defined(MLAS_TARGET_ARM64EC)
+    MatMulComputeHelper helper;
+    if (nullptr != b) {
+      ORT_RETURN_IF_ERROR(helper.Compute(a->Shape(), b->Shape(), &b_scale->Shape(), &b_offset->Shape()));
+    } else {
+      ORT_RETURN_IF_ERROR(helper.Compute(a->Shape(), b_shape_, &b_scale->Shape(), &b_offset->Shape()));
+    }
+
+    Tensor* y = ctx->Output(OUT_Y, helper.OutputShape());
+    if (y->Shape().Size() == 0)
+      return Status::OK();
+
+    const auto* b_scale_data = b_scale->Data<float>();
+    auto a_scale_data = *(a_scale->Data<float>());
+    auto y_scale_data = *(y_scale->Data<float>());
+
+    const int64_t output_scale_size = b_scale->Shape().Size();
+    std::vector<float> output_scales(narrow<size_t>(output_scale_size));
+    for (int64_t i = 0; i < output_scale_size; i++) {
+      output_scales[narrow<size_t>(i)] = (a_scale_data * b_scale_data[narrow<size_t>(i)] / y_scale_data);
+    }
+
+    const size_t num_gemms = helper.OutputOffsets().size();
+    MLAS_GEMM_QUANT_SHAPE_PARAMS gemm_shape;
+    gemm_shape.M = static_cast<size_t>(helper.M());
+    gemm_shape.N = static_cast<size_t>(helper.N());
+    gemm_shape.K = static_cast<size_t>(helper.K());
+
+    AllocatorPtr alloc;
+    ORT_RETURN_IF_ERROR(ctx->GetTempSpaceAllocator(&alloc));
+    auto gemm_output_data = alloc->Alloc(SafeInt<size_t>(gemm_shape.M) *
+                                         gemm_shape.N * sizeof(int32_t) * num_gemms);
+    BufferUniquePtr gemm_output_buffer(gemm_output_data, BufferDeleter(std::move(alloc)));
+    auto* gemm_output = static_cast<int32_t*>(gemm_output_buffer.get());
+
+    std::vector<MLAS_GEMM_U16U8_DATA_PARAMS> gemm_params(num_gemms);
+    std::vector<MLAS_QGEMM_REQUANT_OUTPUT_PROCESSOR> requant_procs;
+    requant_procs.reserve(num_gemms);
+
+    bool is_output_signed = y->IsDataType<int16_t>();
+    int32_t output_offset = is_output_signed ? *(static_cast<const int16_t*>(y_offset->DataRaw()))
+                                             : *(static_cast<const uint16_t*>(y_offset->DataRaw()));
+    auto b_zp_data = static_cast<const uint8_t*>(b_offset->DataRaw());
+    const uint8_t* b_data = b ? static_cast<const uint8_t*>(b->DataRaw()) : static_cast<const uint8_t*>(packed_b_.get());
+
+    for (size_t i = 0; i < num_gemms; i++) {
+      gemm_params[i].A = static_cast<const uint16_t*>(a->DataRaw()) + helper.LeftOffsets()[i] / sizeof(uint16_t);
+      gemm_params[i].lda = gemm_shape.K;
+      gemm_params[i].ZeroPointA = *(static_cast<const uint16_t*>(a_offset->DataRaw()));
+
+      gemm_params[i].B = b_data + helper.RightOffsets()[i];
+      gemm_params[i].ldb = gemm_shape.N;
+      gemm_params[i].BIsPacked = bool(packed_b_);
+      gemm_params[i].ZeroPointB = b_zp_data + helper.RightZeroPointOffsets()[i];
+      gemm_params[i].PerColumnZeroPoints = !IsScalarOr1ElementVector(b_offset);
+
+      gemm_params[i].C = gemm_output + (gemm_shape.M * gemm_shape.N * i);
+      gemm_params[i].ldc = gemm_shape.N;
+
+      requant_procs.emplace_back(static_cast<uint8_t*>(y->MutableDataRaw()) + helper.OutputOffsets()[i],
+                                 static_cast<size_t>(helper.N()),
+                                 nullptr,
+                                 output_scales.data() + helper.RightScaleOffsets()[i],
+                                 output_scales.size() > 1,
+                                 output_offset,
+                                 is_output_signed);
+      gemm_params[i].OutputProcessor = &(requant_procs[i]);
+    }
+
+    MlasGemmU16U8Batch(gemm_shape, gemm_params.data(), num_gemms, ctx->GetOperatorThreadPool());
+
+    return Status::OK();
+#else
+    return ORT_MAKE_STATUS(ONNXRUNTIME, FAIL, "QUInt16 × QUInt8 QLinearMatMul is only supported on ARM64");
+#endif
+  }
+
+  // Original uint8/int8 path
   MatMulComputeHelper helper;
   const uint8_t* b_data;
   bool b_is_signed;
