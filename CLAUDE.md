@@ -291,3 +291,114 @@ The error message is incomplete - it doesn't say WHICH operator is rejecting the
 
 ### Next Steps
 Need to investigate what OTHER operators in the fusion pattern might be rejecting uint16 types. The error occurs during graph optimization, suggesting an intermediate operator (not Q/DQ/QLinearMatMul) doesn't support uint16.
+
+---
+
+## Mixed-Precision Quantization Results (2026-01-06)
+
+### Performance Summary
+- **FP32 Baseline**: 78.0 ms
+- **QUInt8**: 68.2 ms (1.14x faster than FP32)
+- **QUInt16**: 464.3 ms (5.95x slower than FP32)
+- **Mixed-Precision (no LUT)**: **66.07 ms** - 🏆 WINNER (1.18x faster than FP32, 1.03x faster than QUInt8)
+- **Mixed-Precision (with LUT)**: 77.23 ms (lookup table overhead too high)
+
+### Key Files
+- `C:\d\onnxruntime\quantize_mixed_precision.py` - Mixed-precision quantization script
+- `C:\d\onnxruntime\MIXED_PRECISION_RESULTS.md` - Detailed analysis and results
+- `C:\d\models\florence_v1_6_2_d3_tulrv6_multi_text_transformer\evaluate_model.py` - Performance evaluation script
+
+### Next Steps
+
+#### 0. Helper Scripts for Development Workflow
+Create helper scripts to streamline the copy-and-invoke workflow:
+
+**Script 1: `copy_scripts.ps1`** - Copy scripts from ONNX Runtime source to model directory
+```powershell
+# Usage: .\copy_scripts.ps1
+# Copies quantization and evaluation scripts to model directory
+param(
+    [string]$SourceDir = "C:\d\onnxruntime",
+    [string]$TargetDir = "C:\d\models\florence_v1_6_2_d3_tulrv6_multi_text_transformer"
+)
+
+Copy-Item "$SourceDir\quantize_and_evaluate_with_profiling.py" "$TargetDir\" -Force
+Copy-Item "$SourceDir\quantize_mixed_precision.py" "$TargetDir\" -Force
+Copy-Item "$TargetDir\evaluate_model.py" "$TargetDir\" -Force
+Write-Host "Scripts copied successfully!"
+```
+
+**Script 2: `run_quantization.ps1`** - Invoke quantization with proper environment
+```powershell
+# Usage: .\run_quantization.ps1 -QuantType mixed
+param(
+    [ValidateSet("fp32", "dynamic", "quint8", "quint16", "mixed")]
+    [string]$QuantType = "quint8",
+    [switch]$UseLUT
+)
+
+$ModelDir = "C:\d\models\florence_v1_6_2_d3_tulrv6_multi_text_transformer"
+$VenvPython = "C:\d\onnxruntime\.venv_quant_test\Scripts\python.exe"
+
+cd $ModelDir
+
+switch ($QuantType) {
+    "mixed" {
+        $Args = "--model model/florence_v1_6_2_d3_tulrv6_multi_text_transformer.onnx --output model_mixed_precision.onnx"
+        if ($UseLUT) {
+            $Args += " --use-lookup-table"
+        }
+        & $VenvPython quantize_mixed_precision.py $Args
+    }
+    default {
+        & $VenvPython quantize_and_evaluate_with_profiling.py --model model/florence_v1_6_2_d3_tulrv6_multi_text_transformer.onnx --config model/florence_v1_6_2_d3_tulrv6_multi_text_transformer.json --quant-type $QuantType
+    }
+}
+```
+
+#### 1. Code Review: Shared Code Analysis
+Use the code review agent to analyze common code patterns between:
+- `quantize_and_evaluate_with_profiling.py`
+- `quantize_mixed_precision.py`
+
+Focus on:
+- DummyCalibrationDataReader class (duplicated)
+- Model loading and session setup patterns
+- Profiling and evaluation code
+- Quantization configuration handling
+
+#### 2. Script Consolidation
+Combine both scripts into a unified `quantize_and_evaluate_with_profiling.py` with:
+- Single DummyCalibrationDataReader implementation
+- Unified quantization interface supporting all types:
+  - `--quant-type fp32` - Run FP32 baseline
+  - `--quant-type dynamic` - Dynamic quantization
+  - `--quant-type quint8` - Static QUInt8×QUInt8
+  - `--quant-type quint16` - Static QUInt16×QUInt8
+  - `--quant-type mixed` - Mixed-precision (QUInt16 MatMul + QUInt8 everything else)
+- Optional flags:
+  - `--use-lookup-table` - Enable LUT optimization for mixed-precision
+  - `--num-runs` - Number of benchmark runs
+  - `--warmup-runs` - Number of warmup runs
+- Integrated profiling and evaluation
+
+#### 3. Full Quantization Analysis Re-run
+Execute comprehensive benchmark comparing all approaches:
+
+```powershell
+# Run all quantization types with unified script
+.\run_quantization.ps1 -QuantType fp32
+.\run_quantization.ps1 -QuantType dynamic
+.\run_quantization.ps1 -QuantType quint8
+.\run_quantization.ps1 -QuantType quint16
+.\run_quantization.ps1 -QuantType mixed
+.\run_quantization.ps1 -QuantType mixed -UseLUT
+```
+
+Generate comprehensive comparison report including:
+- Performance metrics (mean, median, std, min, max)
+- Operator-level profiling breakdown
+- Model size comparison
+- Memory footprint analysis
+- Accuracy measurements (L2 error vs FP32)
+- Recommendations for production deployment
