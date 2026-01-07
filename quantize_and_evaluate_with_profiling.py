@@ -191,6 +191,30 @@ def parse_calibration_method(method_str: str) -> CalibrationMethod:
     return method_map.get(method_str, CalibrationMethod.MinMax)
 
 
+def create_tensor_quant_overrides_for_matmul(model_path: str) -> Dict:
+    """Create TensorQuantOverrides to quantize MatMul activations as QUInt16.
+
+    This uses ONNX Runtime's native support for per-tensor quantization type overrides
+    to ensure MatMul activations use the full [0, 65535] uint16 range.
+
+    Args:
+        model_path: Path to the model
+
+    Returns:
+        Dictionary suitable for extra_options['TensorQuantOverrides']
+    """
+    model = onnx.load(model_path)
+    matmul_activations = find_matmul_activation_tensors(model)
+
+    # Create overrides dictionary
+    # Format: {tensor_name: [{'quant_type': QuantType.QUInt16}]}
+    overrides = {}
+    for tensor_name in matmul_activations:
+        overrides[tensor_name] = [{'quant_type': QuantType.QUInt16}]
+
+    return overrides
+
+
 def quantize_to_qdq(
     model_path: str,
     output_path: str,
@@ -262,6 +286,114 @@ def quantize_to_dynamic(
     return output_path
 
 
+def quantize_mixed_precision_full_uint16(
+    model_path: str,
+    output_path: str,
+    calibration_reader: CalibrationDataReader,
+    config: Dict,
+) -> str:
+    """Quantize model with full [0, 65535] uint16 range for MatMul activations.
+
+    This is the CORRECT implementation that finds ALL MatMul activations using
+    a two-stage approach:
+    1. Quantize to QUInt8 first (temporary model)
+    2. Analyze QUInt8 model to find ALL MatMul activation tensors
+    3. Create TensorQuantOverrides for those tensors
+    4. Re-quantize FP32 model with overrides
+    5. Result: Full uint16 range for MatMul activations
+
+    Args:
+        model_path: Path to FP32 input model
+        output_path: Path for output mixed-precision model
+        calibration_reader: Calibration data reader
+        config: Quantization configuration
+
+    Returns:
+        Path to output model
+    """
+
+    # Step 1: Quantize to QUInt8 first (temporary)
+    print("\n" + "=" * 80)
+    print("STEP 1/4: Creating temporary QUInt8 model for analysis")
+    print("=" * 80)
+
+    temp_quint8_path = output_path.replace('.onnx', '_temp_quint8.onnx')
+
+    # Rewind calibration reader
+    calibration_reader.rewind()
+
+    # Standard QUInt8 quantization
+    quantize_static(
+        model_input=model_path,
+        model_output=temp_quint8_path,
+        calibration_data_reader=calibration_reader,
+        quant_format=QuantFormat.QDQ,
+        activation_type=QuantType.QUInt8,
+        weight_type=QuantType.QUInt8,
+        calibrate_method=parse_calibration_method(config.get("calibrate_method", "MinMax")),
+        per_channel=config.get("per_channel", False),
+        reduce_range=config.get("reduce_range", False),
+        extra_options=config.get("extra_options", {}),
+    )
+
+    print(f"[OK] Temporary QUInt8 model created: {temp_quint8_path}")
+
+    # Step 2: Analyze QUInt8 model to find ALL MatMul activations
+    print("\n" + "=" * 80)
+    print("STEP 2/4: Analyzing QUInt8 model structure")
+    print("=" * 80)
+
+    matmul_tensors = find_matmul_activations_in_quantized_model(temp_quint8_path)
+    print(f"[OK] Found {len(matmul_tensors)} tensors to upgrade to uint16")
+
+    # Step 3: Create TensorQuantOverrides
+    print("\n" + "=" * 80)
+    print("STEP 3/4: Creating TensorQuantOverrides")
+    print("=" * 80)
+
+    tensor_overrides = {}
+    for tensor_name in matmul_tensors:
+        tensor_overrides[tensor_name] = [{'quant_type': QuantType.QUInt16}]
+
+    print(f"[OK] Created overrides for {len(tensor_overrides)} tensors")
+
+    # Step 4: Re-quantize with overrides applied
+    print("\n" + "=" * 80)
+    print("STEP 4/4: Quantizing with uint16 overrides (FULL [0, 65535] range)")
+    print("=" * 80)
+
+    # Rewind calibration reader for second quantization pass
+    calibration_reader.rewind()
+
+    # Prepare config with overrides
+    extra_options = config.get("extra_options", {}).copy()
+    extra_options["TensorQuantOverrides"] = tensor_overrides
+    extra_options["UseQDQContribOps"] = True  # Enable 16-bit support
+
+    # Final quantization with uint16 overrides
+    quantize_static(
+        model_input=model_path,
+        model_output=output_path,
+        calibration_data_reader=calibration_reader,
+        quant_format=QuantFormat.QDQ,
+        activation_type=QuantType.QUInt8,  # Base type
+        weight_type=QuantType.QUInt8,
+        calibrate_method=parse_calibration_method(config.get("calibrate_method", "MinMax")),
+        per_channel=config.get("per_channel", False),
+        reduce_range=config.get("reduce_range", False),
+        extra_options=extra_options,
+    )
+
+    print(f"[OK] Mixed-precision model with full uint16 range: {output_path}")
+
+    # Step 5: Clean up temporary file
+    if Path(temp_quint8_path).exists():
+        Path(temp_quint8_path).unlink()
+        print("[OK] Cleaned up temporary files")
+
+    return output_path
+
+
 def compute_relative_l2_norm(output1: np.ndarray, output2: np.ndarray) -> float:
     """Compute relative L2 norm between two outputs."""
     diff = output1.flatten() - output2.flatten()
@@ -285,6 +417,10 @@ def evaluate_model_with_profiling(
 
     # Create session with profiling enabled if requested
     options = ort.SessionOptions()
+
+    # CRITICAL: Enable all graph optimizations to fuse QDQ patterns into QLinearMatMul
+    options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+
     if enable_profiling:
         options.enable_profiling = True
         options.profile_file_prefix = profile_prefix
@@ -406,7 +542,11 @@ def get_model_size(model_path: str) -> float:
 
 
 def find_matmul_activation_tensors(model: onnx.ModelProto) -> Set[str]:
-    """Find all activation tensors that feed into MatMul/QLinearMatMul operations."""
+    """Find all activation tensors that feed into MatMul/QLinearMatMul operations.
+
+    NOTE: This function searches the FP32 model and only finds ~73 tensors.
+    For correct mixed-precision quantization, use find_matmul_activations_in_quantized_model() instead.
+    """
     matmul_activations = set()
 
     for node in model.graph.node:
@@ -429,61 +569,283 @@ def find_matmul_activation_tensors(model: onnx.ModelProto) -> Set[str]:
     return matmul_activations
 
 
-def upgrade_quantization_to_uint16(model: onnx.ModelProto, tensor_name: str) -> bool:
-    """Upgrade a specific tensor's quantization from uint8 to uint16."""
-    modified = False
+def find_matmul_activations_in_quantized_model(qdq_model_path: str) -> List[str]:
+    """Find ALL activation tensors that feed MatMul operations in quantized model.
 
-    # Find QuantizeLinear nodes that produce this tensor
+    This function analyzes a QUInt8 quantized model to identify all tensors that
+    should be upgraded to uint16 for mixed-precision quantization.
+
+    CRITICAL: Returns the ORIGINAL FP32 tensor names (before quantization),
+    not the quantized tensor names. This is necessary because TensorQuantOverrides
+    are applied during quantization of the FP32 model.
+
+    Args:
+        qdq_model_path: Path to a QUInt8 quantized model (QDQ format)
+
+    Returns:
+        List of FP32 tensor names to override to QUInt16
+    """
+    print(f"\nAnalyzing quantized model structure: {qdq_model_path}")
+    model = onnx.load(qdq_model_path)
+    fp32_tensor_names = set()
+
+    # Build mapping: quantized tensor -> QuantizeLinear input (FP32 tensor)
+    quantized_to_fp32 = {}
+    for node in model.graph.node:
+        if node.op_type == 'QuantizeLinear':
+            fp32_input = node.input[0]  # Original FP32 tensor
+            quantized_output = node.output[0]  # Quantized tensor (e.g., "xxx_quantized")
+            quantized_to_fp32[quantized_output] = fp32_input
+
+    print(f"  Found {len(quantized_to_fp32)} QuantizeLinear nodes (mapping quantized -> FP32)")
+
+    # Pattern 1: DequantizeLinear -> MatMul (will fuse to QLinearMatMul)
+    # Find DQ nodes whose outputs feed into MatMul
+    dq_to_matmul_inputs = {}
+    for node in model.graph.node:
+        if node.op_type == 'DequantizeLinear':
+            dq_output = node.output[0]
+            dq_input_tensor = node.input[0]  # The quantized tensor name
+            dq_to_matmul_inputs[dq_output] = dq_input_tensor
+
+    print(f"  Found {len(dq_to_matmul_inputs)} DequantizeLinear nodes")
+
+    # Find MatMuls that consume DQ outputs
+    matmul_count = 0
+    for node in model.graph.node:
+        if node.op_type == 'MatMul':
+            matmul_count += 1
+            for input_name in node.input:
+                if input_name in dq_to_matmul_inputs:
+                    # This is a quantized tensor feeding MatMul
+                    quantized_tensor = dq_to_matmul_inputs[input_name]
+
+                    # Map back to FP32 tensor name
+                    if quantized_tensor in quantized_to_fp32:
+                        fp32_tensor = quantized_to_fp32[quantized_tensor]
+                        fp32_tensor_names.add(fp32_tensor)
+                    else:
+                        # Fallback: if it's a weight tensor, it might not have a QuantizeLinear
+                        # In this case, skip it (we only want activations)
+                        pass
+
+    print(f"  Found {matmul_count} MatMul nodes")
+
+    # Pattern 2: Already-fused QLinearMatMul operators
+    # (Less common with QDQ format, but handle it anyway)
+    qlinearmatmul_count = 0
+    for node in model.graph.node:
+        if node.op_type == 'QLinearMatMul':
+            qlinearmatmul_count += 1
+            # Input 0 is the quantized activation tensor
+            if len(node.input) > 0:
+                quantized_tensor = node.input[0]
+                if quantized_tensor in quantized_to_fp32:
+                    fp32_tensor = quantized_to_fp32[quantized_tensor]
+                    fp32_tensor_names.add(fp32_tensor)
+
+    print(f"  Found {qlinearmatmul_count} QLinearMatMul nodes")
+
+    tensor_list = list(fp32_tensor_names)
+    print(f"\n[OK] Found {len(tensor_list)} unique FP32 tensors that feed MatMul operations")
+    print(f"  This is {len(tensor_list)/73:.1f}x more than the FP32 model search (73 tensors)\n")
+
+    return tensor_list
+
+
+def insert_requant_node(
+    model: onnx.ModelProto,
+    tensor_name: str,
+    target_type: int,  # TensorProto.UINT16
+    new_scale_name: str
+) -> str:
+    """Insert DQ->Q pair to requantize tensor from uint8 to uint16 at runtime.
+
+    This allows using the full [0, 65535] range for better precision.
+
+    Args:
+        model: ONNX model
+        tensor_name: Name of uint8 quantized tensor to convert
+        target_type: Target quantization type (UINT16)
+        new_scale_name: Name of the uint16 scale tensor
+
+    Returns:
+        Name of the new uint16 tensor
+    """
+    # Create intermediate FP32 tensor name
+    fp32_tensor_name = tensor_name + "_fp32_intermediate"
+    uint16_tensor_name = tensor_name + "_uint16"
+
+    # Find the QuantizeLinear node that produces this tensor
     for node in model.graph.node:
         if node.op_type == 'QuantizeLinear' and node.output[0] == tensor_name:
-            # Adjust scale for uint16 range
-            scale_name = node.input[1] if len(node.input) > 1 else None
-            zp_name = node.input[2] if len(node.input) > 2 else None
+            scale_name = node.input[1]
+            zp_name = node.input[2] if len(node.input) > 2 else ""
 
-            if scale_name:
+            # Create DequantizeLinear node (uint8 -> FP32)
+            dq_node = helper.make_node(
+                'DequantizeLinear',
+                inputs=[tensor_name, scale_name, zp_name] if zp_name else [tensor_name, scale_name],
+                outputs=[fp32_tensor_name],
+                name=f"DQ_{tensor_name}_to_fp32"
+            )
+
+            # Create new zero_point for uint16 (keep as uint8 type for compatibility)
+            # Get original zero_point value
+            zp_value = 0
+            if zp_name:
                 for init in model.graph.initializer:
-                    if init.name == scale_name:
-                        scale_data = numpy_helper.to_array(init)
-                        new_scale_data = scale_data * (255.0 / 65535.0)
-                        new_init = numpy_helper.from_array(new_scale_data, init.name)
-                        model.graph.initializer.remove(init)
-                        model.graph.initializer.append(new_init)
+                    if init.name == zp_name:
+                        zp_array = numpy_helper.to_array(init)
+                        zp_value = int(zp_array.item()) if zp_array.size == 1 else 0
                         break
 
-            # Keep zero_point as uint8 (ONNX Runtime compatibility)
-            # No modification needed for zero_point
+            new_zp_name = zp_name + "_uint16" if zp_name else tensor_name + "_zp_uint16"
+            new_zp_init = numpy_helper.from_array(np.array(zp_value, dtype=np.uint8), new_zp_name)
+            model.graph.initializer.append(new_zp_init)
 
-            # Update the tensor type in value_info
+            # Create QuantizeLinear node (FP32 -> uint16)
+            q_node = helper.make_node(
+                'QuantizeLinear',
+                inputs=[fp32_tensor_name, new_scale_name, new_zp_name],
+                outputs=[uint16_tensor_name],
+                name=f"Q_{tensor_name}_to_uint16"
+            )
+
+            # Add nodes to graph
+            model.graph.node.extend([dq_node, q_node])
+
+            # Update value_info for the new uint16 tensor
+            # Copy shape info from original tensor
             for value_info in model.graph.value_info:
                 if value_info.name == tensor_name:
-                    value_info.type.tensor_type.elem_type = TensorProto.UINT16
+                    new_value_info = helper.make_tensor_value_info(
+                        uint16_tensor_name,
+                        target_type,
+                        [dim.dim_value if dim.HasField('dim_value') else None
+                         for dim in value_info.type.tensor_type.shape.dim]
+                    )
+                    model.graph.value_info.append(new_value_info)
                     break
 
-            modified = True
+            return uint16_tensor_name
 
-    # Find DequantizeLinear nodes that consume this tensor
-    for node in model.graph.node:
-        if node.op_type == 'DequantizeLinear' and node.input[0] == tensor_name:
-            scale_name = node.input[1] if len(node.input) > 1 else None
+    return tensor_name  # No change if not found
 
-            if scale_name:
+
+def upgrade_quantization_to_uint16(
+    model: onnx.ModelProto,
+    tensor_name: str,
+    scale_strategy: str = "no_adjust"
+) -> bool:
+    """Upgrade a specific tensor's quantization from uint8 to uint16.
+
+    Args:
+        model: ONNX model
+        tensor_name: Name of tensor to upgrade
+        scale_strategy: How to handle scale adjustment:
+            - "no_adjust": Keep scale unchanged, values stay in [0, 255] (fastest, same accuracy as uint8)
+            - "adjust_scale": Multiply scale by (255/65535) to match uint8 range (old approach, causes NaN)
+            - "full_range": Insert DQ->Q pair to requantize to full [0, 65535] range (best accuracy)
+
+    Returns:
+        True if tensor was modified
+    """
+    modified = False
+
+    if scale_strategy == "full_range":
+        # FULL RANGE APPROACH: Insert DQ->Q conversion nodes
+        # This requantizes at runtime to use the full [0, 65535] range
+
+        # Find the QuantizeLinear node that produces this tensor
+        for node in model.graph.node:
+            if node.op_type == 'QuantizeLinear' and node.output[0] == tensor_name:
+                scale_name = node.input[1]
+
+                # Create new scale for uint16 range
                 for init in model.graph.initializer:
                     if init.name == scale_name:
                         scale_data = numpy_helper.to_array(init)
+                        # Scale for full uint16 range [0, 65535]
                         new_scale_data = scale_data * (255.0 / 65535.0)
-                        new_init = numpy_helper.from_array(new_scale_data, init.name)
-                        model.graph.initializer.remove(init)
-                        model.graph.initializer.append(new_init)
+                        new_scale_name = scale_name + "_uint16"
+                        new_scale_init = numpy_helper.from_array(new_scale_data, new_scale_name)
+                        model.graph.initializer.append(new_scale_init)
+
+                        # Insert DQ->Q pair to requantize
+                        new_tensor_name = insert_requant_node(
+                            model, tensor_name, TensorProto.UINT16, new_scale_name
+                        )
+
+                        # Update all downstream nodes to use the new uint16 tensor
+                        for downstream_node in model.graph.node:
+                            for i, input_name in enumerate(downstream_node.input):
+                                if input_name == tensor_name:
+                                    downstream_node.input[i] = new_tensor_name
+
+                        modified = True
+                        break
+                break
+
+    else:
+        # NO_ADJUST or ADJUST_SCALE: Just change tensor type and optionally scale
+        for node in model.graph.node:
+            if node.op_type == 'QuantizeLinear' and node.output[0] == tensor_name:
+                scale_name = node.input[1] if len(node.input) > 1 else None
+
+                if scale_strategy == "adjust_scale" and scale_name:
+                    # OLD APPROACH: Adjust scale (causes NaN issues)
+                    for init in model.graph.initializer:
+                        if init.name == scale_name:
+                            scale_data = numpy_helper.to_array(init)
+                            new_scale_data = scale_data * (255.0 / 65535.0)
+                            new_init = numpy_helper.from_array(new_scale_data, init.name)
+                            model.graph.initializer.remove(init)
+                            model.graph.initializer.append(new_init)
+                            break
+
+                # Update the tensor type in value_info
+                for value_info in model.graph.value_info:
+                    if value_info.name == tensor_name:
+                        value_info.type.tensor_type.elem_type = TensorProto.UINT16
                         break
 
-            modified = True
+                modified = True
+
+        # Find DequantizeLinear nodes that consume this tensor
+        if scale_strategy == "adjust_scale":
+            for node in model.graph.node:
+                if node.op_type == 'DequantizeLinear' and node.input[0] == tensor_name:
+                    scale_name = node.input[1] if len(node.input) > 1 else None
+
+                    if scale_name:
+                        for init in model.graph.initializer:
+                            if init.name == scale_name:
+                                scale_data = numpy_helper.to_array(init)
+                                new_scale_data = scale_data * (255.0 / 65535.0)
+                                new_init = numpy_helper.from_array(new_scale_data, init.name)
+                                model.graph.initializer.remove(init)
+                                model.graph.initializer.append(new_init)
+                                break
+
+                    modified = True
 
     return modified
 
 
-def create_mixed_precision_model(quint8_model_path: str, output_path: str) -> str:
-    """Convert QUInt8 model to mixed precision: QUInt16 MatMul activations, QUInt8 everything else."""
-    print("\n  Upgrading MatMul activations to QUInt16...")
+def create_mixed_precision_model(
+    quint8_model_path: str,
+    output_path: str,
+    scale_strategy: str = "no_adjust"
+) -> str:
+    """Convert QUInt8 model to mixed precision: QUInt16 MatMul activations, QUInt8 everything else.
+
+    Args:
+        quint8_model_path: Path to QUInt8 quantized model
+        output_path: Path to save mixed-precision model
+        scale_strategy: Scale adjustment strategy - "no_adjust", "adjust_scale", or "full_range"
+    """
+    print(f"\n  Upgrading MatMul activations to QUInt16 (strategy: {scale_strategy})...")
 
     # Load the QUInt8 model
     model = onnx.load(quint8_model_path)
@@ -499,7 +861,7 @@ def create_mixed_precision_model(quint8_model_path: str, output_path: str) -> st
     # Upgrade each MatMul activation from uint8 to uint16
     upgraded_count = 0
     for tensor_name in matmul_activations:
-        if upgrade_quantization_to_uint16(model, tensor_name):
+        if upgrade_quantization_to_uint16(model, tensor_name, scale_strategy):
             upgraded_count += 1
 
     print(f"  [OK] Upgraded {upgraded_count} tensors to QUInt16")
@@ -615,12 +977,61 @@ def main():
     quint16_config["activation_type"] = "QUInt16"
     all_configs["quint16"] = quint16_config
 
-    # Mixed-precision configuration (QUInt16 MatMul + QUInt8 everything else)
+    # Mixed-precision configurations (QUInt16 MatMul + QUInt8 everything else)
+    # Variant 1: No scale adjustment (fastest, same accuracy as uint8)
     mixed_config = base_config.copy()
     mixed_config["activation_type"] = "QUInt8"  # Start with QUInt8
     mixed_config["weight_type"] = "QUInt8"
     mixed_config["_is_mixed_precision"] = True  # Flag for special handling
+    mixed_config["_scale_strategy"] = "no_adjust"  # Keep scale unchanged
     all_configs["mixed"] = mixed_config
+
+    # Variant 2: Adjust scale (old approach, for comparison - known to produce NaN)
+    mixed_adjust_config = base_config.copy()
+    mixed_adjust_config["activation_type"] = "QUInt8"
+    mixed_adjust_config["weight_type"] = "QUInt8"
+    mixed_adjust_config["_is_mixed_precision"] = True
+    mixed_adjust_config["_scale_strategy"] = "adjust_scale"
+    all_configs["mixed_adjust"] = mixed_adjust_config
+
+    # Variant 3: Direct uint16 quantization with full [0, 65535] range (reference - performs poorly)
+    # This uses ONNX Runtime's native uint16 support for maximum accuracy
+    quint16_full_config = base_config.copy()
+    quint16_full_config["activation_type"] = "QUInt16"  # Quantize directly to uint16
+    quint16_full_config["weight_type"] = "QUInt8"  # Keep weights as uint8
+    quint16_full_config["extra_options"] = quint16_full_config.get("extra_options", {}).copy()
+    quint16_full_config["extra_options"]["UseQDQContribOps"] = True  # Enable 16-bit support
+    all_configs["quint16_full"] = quint16_full_config
+
+    # Variant 4: Mixed-precision with FULL uint16 range [0, 65535] using TensorQuantOverrides
+    # NOTE: This is the OLD BROKEN approach - only finds ~73 tensors, results in 3,960 FP32 fallbacks
+    mixed_u16_config = base_config.copy()
+    mixed_u16_config["activation_type"] = "QUInt8"  # Base quantization is uint8
+    mixed_u16_config["weight_type"] = "QUInt8"
+    mixed_u16_config["_use_tensor_overrides"] = True  # Flag to use TensorQuantOverrides
+    mixed_u16_config["extra_options"] = mixed_u16_config.get("extra_options", {}).copy()
+    mixed_u16_config["extra_options"]["UseQDQContribOps"] = True  # Enable 16-bit support
+    all_configs["mixed_u16"] = mixed_u16_config
+
+    # Variant 5: Mixed-precision with FULL uint16 range using TWO-STAGE approach (FIXED)
+    # This is the CORRECT approach: finds ALL MatMul activations (~5,000 tensors)
+    # Expected: 5,995 QLinearMatMul ops, 0 FP32 fallbacks, 100-150ms performance
+    mixed_u16_fixed_config = base_config.copy()
+    mixed_u16_fixed_config["activation_type"] = "QUInt8"  # Base quantization is uint8
+    mixed_u16_fixed_config["weight_type"] = "QUInt8"
+    mixed_u16_fixed_config["_use_two_stage_uint16"] = True  # Flag to use two-stage approach
+    mixed_u16_fixed_config["extra_options"] = mixed_u16_fixed_config.get("extra_options", {}).copy()
+    mixed_u16_fixed_config["extra_options"]["UseQDQContribOps"] = True  # Enable 16-bit support
+    all_configs["mixed_u16_fixed"] = mixed_u16_fixed_config
+
+    # Dynamic quantization configuration
+    dynamic_config = {
+        "weight_type": "QInt8",
+        "per_channel": False,
+        "reduce_range": False,
+        "_is_dynamic": True  # Flag for special handling
+    }
+    all_configs["dynamic"] = dynamic_config
 
     # Select which configs to test
     if args.configs:
@@ -674,50 +1085,115 @@ def main():
 
         qdq_model_path = output_dir / f"{model_name}_{config_name}_qdq.onnx"
 
-        # Quantize to QDQ
+        # Quantize
         try:
-            calibration_reader.rewind()
+            # Check if this is dynamic quantization
+            if config.get("_is_dynamic", False):
+                # Dynamic quantization (no calibration needed)
+                dynamic_model_path = output_dir / f"{model_name}_{config_name}.onnx"
+                quantize_to_dynamic(args.model, str(dynamic_model_path), config)
 
-            # Check if this is mixed-precision
-            if config.get("_is_mixed_precision", False):
-                # Mixed-precision: Two-step process
-                # Step 1: Quantize to QUInt8
-                quint8_temp_path = output_dir / f"{model_name}_{config_name}_quint8_temp.onnx"
-                print(f"\n  Step 1: Quantizing to QUInt8 (temporary)...")
-                quantize_to_qdq(args.model, str(quint8_temp_path), calibration_reader, config)
+                # Evaluate dynamic model
+                print(f"\nEvaluating dynamic model ({config_name})...")
+                _, dyn_l2, dyn_timing, dyn_profile = evaluate_model_with_profiling(
+                    str(dynamic_model_path), validation_samples, fp32_outputs,
+                    enable_profiling=args.enable_profiling,
+                    profile_prefix=f"{model_name}_{config_name}"
+                )
+                dyn_profile_analysis = analyze_profile(dyn_profile) if dyn_profile else {}
+                print(f"[OK] Dynamic evaluation complete ({config_name})")
+                print_results(f"Dynamic ({config_name})", dyn_l2, dyn_timing, dyn_profile_analysis)
 
-                # Step 2: Upgrade MatMul activations to QUInt16
-                print(f"  Step 2: Converting to mixed-precision...")
-                create_mixed_precision_model(str(quint8_temp_path), str(qdq_model_path))
-
-                # Clean up temporary file
-                if quint8_temp_path.exists():
-                    quint8_temp_path.unlink()
+                all_results[f"Dynamic_{config_name}"] = {
+                    "relative_l2": dyn_l2,
+                    "timing": dyn_timing,
+                    "size_mb": get_model_size(str(dynamic_model_path)),
+                    "profile_file": dyn_profile,
+                    "profile_analysis": dyn_profile_analysis,
+                    "config": config
+                }
             else:
-                # Normal quantization
-                quantize_to_qdq(args.model, str(qdq_model_path), calibration_reader, config)
+                # QDQ quantization (static)
+                calibration_reader.rewind()
 
-            # Evaluate QDQ model
-            print(f"\nEvaluating QDQ model ({config_name})...")
-            _, qdq_l2, qdq_timing, qdq_profile = evaluate_model_with_profiling(
-                str(qdq_model_path), validation_samples, fp32_outputs,
-                enable_profiling=args.enable_profiling,
-                profile_prefix=f"{model_name}_{config_name}_qdq"
-            )
-            qdq_profile_analysis = analyze_profile(qdq_profile) if qdq_profile else {}
-            print(f"[OK] QDQ evaluation complete ({config_name})")
-            print_results(f"QDQ ({config_name})", qdq_l2, qdq_timing, qdq_profile_analysis)
+                # Check if we should use two-stage TensorQuantOverrides (FIXED approach)
+                if config.get("_use_two_stage_uint16", False):
+                    # Mixed-precision using two-stage TensorQuantOverrides
+                    # This is the CORRECT implementation that finds ALL MatMul activations
+                    print(f"\n  Using two-stage quantization for full uint16 range...")
+                    quantize_mixed_precision_full_uint16(
+                        args.model,
+                        str(qdq_model_path),
+                        calibration_reader,
+                        config
+                    )
 
-            all_results[f"QDQ_{config_name}"] = {
-                "relative_l2": qdq_l2,
-                "timing": qdq_timing,
-                "size_mb": get_model_size(str(qdq_model_path)),
-                "profile_file": qdq_profile,
-                "profile_analysis": qdq_profile_analysis,
-                "config": config
-            }
+                # Check if we should use TensorQuantOverrides for mixed-precision (OLD broken approach)
+                elif config.get("_use_tensor_overrides", False):
+                    # Mixed-precision using TensorQuantOverrides - OLD APPROACH (only finds 73 tensors)
+                    print(f"\n  WARNING: Using OLD TensorQuantOverrides approach (only finds ~73 tensors)")
+                    print(f"  Consider using _use_two_stage_uint16 instead for better coverage")
+                    tensor_overrides = create_tensor_quant_overrides_for_matmul(args.model)
+                    print(f"  [OK] Created overrides for {len(tensor_overrides)} tensors")
+
+                    # Add to extra_options
+                    config_with_overrides = config.copy()
+                    extra_opts = config_with_overrides.get("extra_options", {}).copy()
+                    extra_opts["TensorQuantOverrides"] = tensor_overrides
+                    config_with_overrides["extra_options"] = extra_opts
+
+                    # Quantize with overrides
+                    print(f"  Quantizing with uint16 overrides for MatMul activations...")
+                    quantize_to_qdq(args.model, str(qdq_model_path), calibration_reader, config_with_overrides)
+
+                # Check if this is mixed-precision (post-processing approach)
+                elif config.get("_is_mixed_precision", False):
+                    # Mixed-precision: Two-step process (old approach)
+                    scale_strategy = config.get("_scale_strategy", "no_adjust")
+
+                    # Step 1: Quantize to QUInt8
+                    quint8_temp_path = output_dir / f"{model_name}_{config_name}_quint8_temp.onnx"
+                    print(f"\n  Step 1: Quantizing to QUInt8 (temporary)...")
+                    quantize_to_qdq(args.model, str(quint8_temp_path), calibration_reader, config)
+
+                    # Step 2: Upgrade MatMul activations to QUInt16
+                    print(f"  Step 2: Converting to mixed-precision (strategy: {scale_strategy})...")
+                    create_mixed_precision_model(
+                        str(quint8_temp_path),
+                        str(qdq_model_path),
+                        scale_strategy=scale_strategy
+                    )
+
+                    # Clean up temporary file
+                    if quint8_temp_path.exists():
+                        quint8_temp_path.unlink()
+                else:
+                    # Normal quantization
+                    quantize_to_qdq(args.model, str(qdq_model_path), calibration_reader, config)
+
+                # Evaluate QDQ model
+                print(f"\nEvaluating QDQ model ({config_name})...")
+                _, qdq_l2, qdq_timing, qdq_profile = evaluate_model_with_profiling(
+                    str(qdq_model_path), validation_samples, fp32_outputs,
+                    enable_profiling=args.enable_profiling,
+                    profile_prefix=f"{model_name}_{config_name}_qdq"
+                )
+                qdq_profile_analysis = analyze_profile(qdq_profile) if qdq_profile else {}
+                print(f"[OK] QDQ evaluation complete ({config_name})")
+                print_results(f"QDQ ({config_name})", qdq_l2, qdq_timing, qdq_profile_analysis)
+
+                all_results[f"QDQ_{config_name}"] = {
+                    "relative_l2": qdq_l2,
+                    "timing": qdq_timing,
+                    "size_mb": get_model_size(str(qdq_model_path)),
+                    "profile_file": qdq_profile,
+                    "profile_analysis": qdq_profile_analysis,
+                    "config": config
+                }
         except Exception as e:
-            print(f"Error during QDQ quantization ({config_name}): {e}")
+            print(f"Error during quantization ({config_name}): {e}")
+            import traceback
+            traceback.print_exc()
 
     # Print final comparison
     print("\n" + "=" * 80)
