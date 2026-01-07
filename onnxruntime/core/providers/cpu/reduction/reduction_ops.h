@@ -368,6 +368,425 @@ class ReduceAggregatorMean : public ReduceAggregatorSum<T> {
   }
 };
 
+//
+// NEON-optimized ReduceAggregatorSum and ReduceAggregatorMean specializations for uint16_t
+// These provide significant performance improvements for uint16 quantized models on ARM64
+//
+#if defined(MLAS_TARGET_ARM64) || defined(MLAS_TARGET_ARM64EC)
+#include <arm_neon.h>
+
+// First, specialize ReduceAggregatorSum<uint16_t> to avoid MatMul dependency
+template <>
+class ReduceAggregatorSum<uint16_t> : public ReduceAggregator<uint16_t, uint16_t> {
+ public:
+  inline ReduceAggregatorSum(int64_t N, const uint16_t&) : ReduceAggregator<uint16_t, uint16_t>(N, 0) {}
+  inline void update(const uint16_t& v) { this->accumulator_ += v; }
+
+  // NEON-optimized sum aggregation
+  static uint16_t aggall(const uint16_t* from_data, int64_t size) {
+    int64_t i = 0;
+    uint32x4_t sum_vec_lo = vdupq_n_u32(0);
+    uint32x4_t sum_vec_hi = vdupq_n_u32(0);
+
+    for (; i + 8 <= size; i += 8) {
+      uint16x8_t data = vld1q_u16(from_data + i);
+      uint32x4_t data_lo = vmovl_u16(vget_low_u16(data));
+      uint32x4_t data_hi = vmovl_u16(vget_high_u16(data));
+      sum_vec_lo = vaddq_u32(sum_vec_lo, data_lo);
+      sum_vec_hi = vaddq_u32(sum_vec_hi, data_hi);
+    }
+
+    sum_vec_lo = vaddq_u32(sum_vec_lo, sum_vec_hi);
+    uint32x2_t sum_pair = vadd_u32(vget_low_u32(sum_vec_lo), vget_high_u32(sum_vec_lo));
+    uint32_t sum = vget_lane_u32(sum_pair, 0) + vget_lane_u32(sum_pair, 1);
+
+    for (; i < size; i++) {
+      sum += static_cast<uint32_t>(from_data[i]);
+    }
+
+    return static_cast<uint16_t>(sum);
+  }
+
+  inline uint16_t aggall(const uint16_t* from_data) {
+    return aggall(from_data, this->N_);
+  }
+
+  static void fill_for_empty_set(Tensor& output) {
+    EigenMap<uint16_t>(output).array() = static_cast<uint16_t>(0);
+  }
+
+  static inline FastReduceKind WhichFastReduce() {
+    return FastReduceKind::kKR | FastReduceKind::kRK | FastReduceKind::kKRK | FastReduceKind::kRKR;
+  }
+
+  // Simplified FastReduceKR for ReduceSum (no division needed)
+  static void FastReduceKR(const Tensor& input, const gsl::span<const int64_t>& fast_shape,
+                           Tensor& output, concurrency::ThreadPool* tp) {
+    const uint16_t* data = input.Data<uint16_t>();
+    uint16_t* out = output.MutableData<uint16_t>();
+    int64_t stridei = fast_shape[1];
+
+    concurrency::ThreadPool::TryParallelFor(
+        tp, onnxruntime::narrow<std::ptrdiff_t>(fast_shape[0]),
+        ParallelReduceFastCost(1, stridei, sizeof(uint16_t), 6),
+        [data, stridei, out](ptrdiff_t first, ptrdiff_t last) {
+          for (ptrdiff_t d = first; d < last; ++d) {
+            out[d] = aggall(data + d * stridei, stridei);
+          }
+        });
+  }
+
+  static void FastReduceRK(const Tensor& input, const gsl::span<const int64_t>& fast_shape,
+                           Tensor& output, concurrency::ThreadPool* tp) {
+    int64_t N = fast_shape[1];
+    const uint16_t* data = input.Data<uint16_t>();
+    uint16_t* out = output.MutableData<uint16_t>();
+    int64_t n_rows = fast_shape[0];
+
+    memcpy(out, data, SafeInt<size_t>(N) * sizeof(uint16_t));
+
+    concurrency::ThreadPool::TryParallelFor(
+        tp, onnxruntime::narrow<std::ptrdiff_t>(N),
+        ParallelReduceFastCost(1, n_rows, sizeof(uint16_t), 6),
+        [data, out, N, n_rows](ptrdiff_t begin, ptrdiff_t end) {
+          for (ptrdiff_t col = begin; col < end; col += 8) {
+            ptrdiff_t actual_end = std::min(col + 8, end);
+
+            if (actual_end - col == 8) {
+              uint32x4_t sum_lo = vmovl_u16(vget_low_u16(vld1q_u16(out + col)));
+              uint32x4_t sum_hi = vmovl_u16(vget_high_u16(vld1q_u16(out + col)));
+
+              for (int64_t row = 1; row < n_rows; ++row) {
+                uint16x8_t row_data = vld1q_u16(data + row * N + col);
+                sum_lo = vaddq_u32(sum_lo, vmovl_u16(vget_low_u16(row_data)));
+                sum_hi = vaddq_u32(sum_hi, vmovl_u16(vget_high_u16(row_data)));
+              }
+
+              uint16x8_t result = vcombine_u16(vmovn_u32(sum_lo), vmovn_u32(sum_hi));
+              vst1q_u16(out + col, result);
+            } else {
+              for (ptrdiff_t c = col; c < actual_end; ++c) {
+                uint32_t sum = static_cast<uint32_t>(out[c]);
+                for (int64_t row = 1; row < n_rows; ++row) {
+                  sum += static_cast<uint32_t>(data[row * N + c]);
+                }
+                out[c] = static_cast<uint16_t>(sum);
+              }
+            }
+          }
+        });
+  }
+
+  // Simple FastReduceKRK without MatMul
+  static void FastReduceKRK(const Tensor& input, const gsl::span<const int64_t>& fast_shape,
+                            Tensor& output, concurrency::ThreadPool* tp) {
+    int64_t K1 = fast_shape[0];
+    int64_t R = fast_shape[1];
+    int64_t K2 = fast_shape[2];
+    const uint16_t* data = input.Data<uint16_t>();
+    uint16_t* out = output.MutableData<uint16_t>();
+    int64_t stridei = R * K2;
+    int64_t strideo = K2;
+
+    concurrency::ThreadPool::TryParallelFor(
+        tp, onnxruntime::narrow<std::ptrdiff_t>(K1),
+        ParallelReduceFastCost(R, K2, sizeof(uint16_t), 6),
+        [data, out, K2, R, stridei, strideo](ptrdiff_t begin, ptrdiff_t last) {
+          for (ptrdiff_t d = begin; d < last; ++d) {
+            const uint16_t* in_slice = data + stridei * d;
+            uint16_t* out_slice = out + strideo * d;
+
+            for (int64_t k2 = 0; k2 < K2; ++k2) {
+              uint32_t sum = 0;
+              for (int64_t r = 0; r < R; ++r) {
+                sum += static_cast<uint32_t>(in_slice[r * K2 + k2]);
+              }
+              out_slice[k2] = static_cast<uint16_t>(sum);
+            }
+          }
+        });
+  }
+
+  static void FastReduceRKR(const Tensor& input, const gsl::span<const int64_t>& fast_shape,
+                            Tensor& output, concurrency::ThreadPool* tp) {
+    ReduceAggregator<uint16_t, uint16_t>::CommonFastReduceRKR(
+        input, fast_shape, output, tp,
+        [=](const uint16_t*) -> uint16_t { return 0; },
+        [=](uint16_t& value, const uint16_t* p, int64_t size) {
+          value += aggall(p, size);
+        });
+  }
+};
+
+// Now specialize ReduceAggregatorMean<uint16_t>
+template <>
+class ReduceAggregatorMean<uint16_t> : public ReduceAggregatorSum<uint16_t> {
+ public:
+  inline ReduceAggregatorMean(int64_t N, const uint16_t&) : ReduceAggregatorSum<uint16_t>(N, 0) {}
+
+  // NEON-optimized aggall for uint16_t
+  static uint16_t aggall(const uint16_t* from_data, int64_t size) {
+    int64_t i = 0;
+    uint32x4_t sum_vec_lo = vdupq_n_u32(0);
+    uint32x4_t sum_vec_hi = vdupq_n_u32(0);
+
+    // Process 8 elements at a time using NEON
+    for (; i + 8 <= size; i += 8) {
+      uint16x8_t data = vld1q_u16(from_data + i);
+      uint32x4_t data_lo = vmovl_u16(vget_low_u16(data));
+      uint32x4_t data_hi = vmovl_u16(vget_high_u16(data));
+      sum_vec_lo = vaddq_u32(sum_vec_lo, data_lo);
+      sum_vec_hi = vaddq_u32(sum_vec_hi, data_hi);
+    }
+
+    // Horizontal sum of vector accumulators
+    sum_vec_lo = vaddq_u32(sum_vec_lo, sum_vec_hi);
+    uint32x2_t sum_pair = vadd_u32(vget_low_u32(sum_vec_lo), vget_high_u32(sum_vec_lo));
+    uint32_t sum = vget_lane_u32(sum_pair, 0) + vget_lane_u32(sum_pair, 1);
+
+    // Handle remaining elements
+    for (; i < size; i++) {
+      sum += static_cast<uint32_t>(from_data[i]);
+    }
+
+    // Compute mean
+    return static_cast<uint16_t>(sum / static_cast<uint32_t>(size));
+  }
+
+  inline uint16_t aggall(const uint16_t* from_data) {
+    return aggall(from_data, this->N_);
+  }
+
+  inline uint16_t get_value() {
+    return static_cast<uint16_t>(this->accumulator_ / static_cast<uint32_t>(this->N_));
+  }
+
+  static void fill_for_empty_set(Tensor& output) {
+    EigenMap<uint16_t>(output).array() = static_cast<uint16_t>(0);
+  }
+
+  // Fast reduction - reuse base class method signatures
+  static inline FastReduceKind WhichFastReduce() {
+    return FastReduceKind::kKR | FastReduceKind::kRK | FastReduceKind::kKRK | FastReduceKind::kRKR;
+  }
+
+  // NEON-optimized FastReduceKR: reduce along last dimension
+  // Pattern: [K, R] where K is kept, R is reduced
+  // Example: Reducing channels in [batch, height, width, channels]
+  static void FastReduceKR(const Tensor& input, const gsl::span<const int64_t>& fast_shape,
+                           Tensor& output, concurrency::ThreadPool* tp) {
+    const uint16_t* data = input.Data<uint16_t>();
+    uint16_t* out = output.MutableData<uint16_t>();
+    int64_t stridei = fast_shape[1];  // Number of elements to reduce per output
+    int64_t num_outputs = fast_shape[0];  // Number of output elements
+
+    concurrency::ThreadPool::TryParallelFor(
+        tp, onnxruntime::narrow<std::ptrdiff_t>(num_outputs),
+        ParallelReduceFastCost(1, stridei, sizeof(uint16_t), 6),
+        [data, stridei, out](ptrdiff_t first, ptrdiff_t last) {
+          for (ptrdiff_t d = first; d < last; ++d) {
+            const uint16_t* row_data = data + d * stridei;
+            int64_t i = 0;
+            uint32x4_t sum_vec_lo = vdupq_n_u32(0);
+            uint32x4_t sum_vec_hi = vdupq_n_u32(0);
+
+            // Process 8 elements at a time
+            for (; i + 8 <= stridei; i += 8) {
+              uint16x8_t vec_data = vld1q_u16(row_data + i);
+              uint32x4_t data_lo = vmovl_u16(vget_low_u16(vec_data));
+              uint32x4_t data_hi = vmovl_u16(vget_high_u16(vec_data));
+              sum_vec_lo = vaddq_u32(sum_vec_lo, data_lo);
+              sum_vec_hi = vaddq_u32(sum_vec_hi, data_hi);
+            }
+
+            // Horizontal sum
+            sum_vec_lo = vaddq_u32(sum_vec_lo, sum_vec_hi);
+            uint32x2_t sum_pair = vadd_u32(vget_low_u32(sum_vec_lo), vget_high_u32(sum_vec_lo));
+            uint32_t sum = vget_lane_u32(sum_pair, 0) + vget_lane_u32(sum_pair, 1);
+
+            // Handle remainder
+            for (; i < stridei; i++) {
+              sum += static_cast<uint32_t>(row_data[i]);
+            }
+
+            // Compute mean
+            out[d] = static_cast<uint16_t>(sum / static_cast<uint32_t>(stridei));
+          }
+        });
+  }
+
+  // NEON-optimized FastReduceRK: reduce along first dimension
+  // Pattern: [R, K] where R is reduced, K is kept
+  // Example: Reducing batch dimension in [batch, features]
+  static void FastReduceRK(const Tensor& input, const gsl::span<const int64_t>& fast_shape,
+                           Tensor& output, concurrency::ThreadPool* tp) {
+    int64_t N = fast_shape[1];  // Number of kept dimensions
+    int64_t n_rows = fast_shape[0];  // Number of rows to reduce
+    const uint16_t* data = input.Data<uint16_t>();
+    uint16_t* out = output.MutableData<uint16_t>();
+
+    // Initialize output with first row
+    memcpy(out, data, SafeInt<size_t>(N) * sizeof(uint16_t));
+
+    // Accumulate remaining rows using NEON
+    concurrency::ThreadPool::TryParallelFor(
+        tp, onnxruntime::narrow<std::ptrdiff_t>(N),
+        ParallelReduceFastCost(1, n_rows, sizeof(uint16_t), 6),
+        [data, out, N, n_rows](ptrdiff_t begin, ptrdiff_t end) {
+          for (ptrdiff_t col = begin; col < end; col += 8) {
+            ptrdiff_t actual_end = std::min(col + 8, end);
+            int vec_size = static_cast<int>(actual_end - col);
+
+            if (vec_size == 8) {
+              // Full vector processing
+              uint32x4_t sum_lo = vmovl_u16(vget_low_u16(vld1q_u16(out + col)));
+              uint32x4_t sum_hi = vmovl_u16(vget_high_u16(vld1q_u16(out + col)));
+
+              for (int64_t row = 1; row < n_rows; ++row) {
+                uint16x8_t row_data = vld1q_u16(data + row * N + col);
+                sum_lo = vaddq_u32(sum_lo, vmovl_u16(vget_low_u16(row_data)));
+                sum_hi = vaddq_u32(sum_hi, vmovl_u16(vget_high_u16(row_data)));
+              }
+
+              // Divide by n_rows to get mean (scalar division, NEON doesn't have integer divide)
+              uint32_t divisor = static_cast<uint32_t>(n_rows);
+              uint32_t sum_array[8];
+              vst1q_u32(sum_array, sum_lo);
+              vst1q_u32(sum_array + 4, sum_hi);
+
+              uint16_t result_array[8];
+              for (int i = 0; i < 8; ++i) {
+                result_array[i] = static_cast<uint16_t>(sum_array[i] / divisor);
+              }
+
+              // Store result
+              vst1q_u16(out + col, vld1q_u16(result_array));
+            } else {
+              // Scalar fallback for partial vectors
+              for (ptrdiff_t c = col; c < actual_end; ++c) {
+                uint32_t sum = static_cast<uint32_t>(out[c]);
+                for (int64_t row = 1; row < n_rows; ++row) {
+                  sum += static_cast<uint32_t>(data[row * N + c]);
+                }
+                out[c] = static_cast<uint16_t>(sum / static_cast<uint32_t>(n_rows));
+              }
+            }
+          }
+        });
+  }
+
+  // NEON-optimized FastReduceKRK: reduce middle dimension
+  // Pattern: [K1, R, K2] where R is reduced, K1 and K2 are kept
+  static void FastReduceKRK(const Tensor& input, const gsl::span<const int64_t>& fast_shape,
+                            Tensor& output, concurrency::ThreadPool* tp) {
+    int64_t K1 = fast_shape[0];
+    int64_t R = fast_shape[1];
+    int64_t K2 = fast_shape[2];
+    const uint16_t* data = input.Data<uint16_t>();
+    uint16_t* out = output.MutableData<uint16_t>();
+    int64_t stridei = R * K2;
+    int64_t strideo = K2;
+
+    concurrency::ThreadPool::TryParallelFor(
+        tp, onnxruntime::narrow<std::ptrdiff_t>(K1),
+        ParallelReduceFastCost(R, K2, sizeof(uint16_t), 6),
+        [data, out, K2, R, stridei, strideo](ptrdiff_t begin, ptrdiff_t last) {
+          for (ptrdiff_t d = begin; d < last; ++d) {
+            const uint16_t* in_slice = data + stridei * d;
+            uint16_t* out_slice = out + strideo * d;
+
+            // For each output element in K2 dimension
+            for (int64_t k2 = 0; k2 < K2; ++k2) {
+              uint32_t sum = 0;
+
+              // Reduce across R dimension using NEON where possible
+              int64_t r = 0;
+              uint32x4_t sum_vec = vdupq_n_u32(0);
+
+              // Process 4 elements at a time (loading strided values)
+              for (; r + 4 <= R; r += 4) {
+                uint16_t vals[4];
+                vals[0] = in_slice[r * K2 + k2];
+                vals[1] = in_slice[(r + 1) * K2 + k2];
+                vals[2] = in_slice[(r + 2) * K2 + k2];
+                vals[3] = in_slice[(r + 3) * K2 + k2];
+
+                uint16x4_t data_u16 = vld1_u16(vals);
+                uint32x4_t data_u32 = vmovl_u16(data_u16);
+                sum_vec = vaddq_u32(sum_vec, data_u32);
+              }
+
+              // Horizontal sum
+              uint32x2_t sum_pair = vadd_u32(vget_low_u32(sum_vec), vget_high_u32(sum_vec));
+              sum = vget_lane_u32(sum_pair, 0) + vget_lane_u32(sum_pair, 1);
+
+              // Handle remainder
+              for (; r < R; r++) {
+                sum += static_cast<uint32_t>(in_slice[r * K2 + k2]);
+              }
+
+              // Compute mean
+              out_slice[k2] = static_cast<uint16_t>(sum / static_cast<uint32_t>(R));
+            }
+          }
+        });
+  }
+
+  // NEON-optimized FastReduceRKR: reduce outer dimensions
+  // Pattern: [R1, K, R2] where R1 and R2 are reduced, K is kept
+  static void FastReduceRKR(const Tensor& input, const gsl::span<const int64_t>& fast_shape,
+                            Tensor& output, concurrency::ThreadPool* tp) {
+    int64_t R1 = fast_shape[0];
+    int64_t K = fast_shape[1];
+    int64_t R2 = fast_shape[2];
+    const uint16_t* data = input.Data<uint16_t>();
+    uint16_t* out = output.MutableData<uint16_t>();
+    int64_t stride = K * R2;
+    uint32_t total_reduced = static_cast<uint32_t>(R1 * R2);
+
+    // Initialize output to zero
+    memset(out, 0, SafeInt<size_t>(K) * sizeof(uint16_t));
+
+    // Accumulate all values
+    concurrency::ThreadPool::TryParallelFor(
+        tp, onnxruntime::narrow<std::ptrdiff_t>(K),
+        ParallelReduceFastCost(R1 * R2, 1, sizeof(uint16_t), 6),
+        [data, out, K, R1, R2, stride, total_reduced](ptrdiff_t begin, ptrdiff_t end) {
+          for (ptrdiff_t k = begin; k < end; ++k) {
+            uint32_t sum = 0;
+
+            for (int64_t r1 = 0; r1 < R1; ++r1) {
+              const uint16_t* row_data = data + r1 * stride + k * R2;
+              int64_t r2 = 0;
+              uint32x4_t sum_vec = vdupq_n_u32(0);
+
+              // Process 8 elements at a time
+              for (; r2 + 8 <= R2; r2 += 8) {
+                uint16x8_t vec_data = vld1q_u16(row_data + r2);
+                uint32x4_t data_lo = vmovl_u16(vget_low_u16(vec_data));
+                uint32x4_t data_hi = vmovl_u16(vget_high_u16(vec_data));
+                sum_vec = vaddq_u32(sum_vec, data_lo);
+                sum_vec = vaddq_u32(sum_vec, data_hi);
+              }
+
+              // Horizontal sum
+              uint32x2_t sum_pair = vadd_u32(vget_low_u32(sum_vec), vget_high_u32(sum_vec));
+              sum += vget_lane_u32(sum_pair, 0) + vget_lane_u32(sum_pair, 1);
+
+              // Handle remainder
+              for (; r2 < R2; r2++) {
+                sum += static_cast<uint32_t>(row_data[r2]);
+              }
+            }
+
+            // Compute mean
+            out[k] = static_cast<uint16_t>(sum / total_reduced);
+          }
+        });
+  }
+};
+#endif  // MLAS_TARGET_ARM64 || MLAS_TARGET_ARM64EC
+
 template <typename T>
 class ReduceAggregatorMax : public ReduceAggregator<T> {
  public:

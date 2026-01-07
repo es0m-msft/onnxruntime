@@ -98,6 +98,23 @@ namespace onnxruntime {
       KernelDefBuilder().TypeConstraint("T", DataTypeImpl::GetTensorType<uint8_t>()), \
       x<uint8_t>);
 
+#define REGISTER_UNARY_ELEMENTWISE_KERNEL_UINT16_ONLY(x, sinceVersion)                 \
+  ONNX_CPU_OPERATOR_TYPED_KERNEL(                                                      \
+      x,                                                                               \
+      sinceVersion,                                                                    \
+      uint16_t,                                                                        \
+      KernelDefBuilder().TypeConstraint("T", DataTypeImpl::GetTensorType<uint16_t>()), \
+      x<uint16_t>);
+
+#define REGISTER_UNARY_ELEMENTWISE_VERSIONED_KERNEL_UINT16_ONLY(x, startVer, endVer)   \
+  ONNX_CPU_OPERATOR_VERSIONED_TYPED_KERNEL(                                            \
+      x,                                                                               \
+      startVer,                                                                        \
+      endVer,                                                                          \
+      uint16_t,                                                                        \
+      KernelDefBuilder().TypeConstraint("T", DataTypeImpl::GetTensorType<uint16_t>()), \
+      x<uint16_t>);
+
 #define REGISTER_UNARY_ELEMENTWISE_KERNEL_INT8_ONLY(x, sinceVersion)                 \
   ONNX_CPU_OPERATOR_TYPED_KERNEL(                                                    \
       x,                                                                             \
@@ -218,6 +235,12 @@ REGISTER_UNARY_ELEMENTWISE_VERSIONED_KERNEL_INT64_ONLY(ReduceMean, 1, 10);
 REGISTER_UNARY_ELEMENTWISE_VERSIONED_KERNEL_INT64_ONLY(ReduceMean, 11, 12);
 REGISTER_UNARY_ELEMENTWISE_VERSIONED_KERNEL_INT64_ONLY(ReduceMean, 13, 17);
 REGISTER_UNARY_ELEMENTWISE_KERNEL_INT64_ONLY(ReduceMean, 18);
+#if defined(MLAS_TARGET_ARM64) || defined(MLAS_TARGET_ARM64EC)
+REGISTER_UNARY_ELEMENTWISE_VERSIONED_KERNEL_UINT16_ONLY(ReduceMean, 1, 10);
+REGISTER_UNARY_ELEMENTWISE_VERSIONED_KERNEL_UINT16_ONLY(ReduceMean, 11, 12);
+REGISTER_UNARY_ELEMENTWISE_VERSIONED_KERNEL_UINT16_ONLY(ReduceMean, 13, 17);
+REGISTER_UNARY_ELEMENTWISE_KERNEL_UINT16_ONLY(ReduceMean, 18);
+#endif
 
 REGISTER_UNARY_ELEMENTWISE_VERSIONED_KERNEL(ReduceMin, 1, 10);
 REGISTER_UNARY_ELEMENTWISE_VERSIONED_KERNEL_INT64_ONLY(ReduceMin, 1, 10);
@@ -1156,6 +1179,10 @@ template class ReduceSum<float>;
 template class ReduceSum<int32_t>;
 template class ReduceSum<double>;
 template class ReduceSum<int64_t>;
+#if defined(MLAS_TARGET_ARM64) || defined(MLAS_TARGET_ARM64EC)
+template class ReduceSum<uint16_t>;
+template class ReduceMean<uint16_t>;
+#endif
 
 template void CommonReduce1Loop<ReduceAggregatorSum<float>>(OpKernelContext* ctx,
                                                             const gsl::span<const int64_t>& axes_, int64_t keepdims_,
@@ -1169,5 +1196,13 @@ template void CommonReduce1Loop<ReduceAggregatorSum<double>>(OpKernelContext* ct
 template void CommonReduce1Loop<ReduceAggregatorSum<int64_t>>(OpKernelContext* ctx,
                                                               const gsl::span<const int64_t>& axes_, int64_t keepdims_,
                                                               bool noop_with_empty_axes);
+#if defined(MLAS_TARGET_ARM64) || defined(MLAS_TARGET_ARM64EC)
+template void CommonReduce1Loop<ReduceAggregatorSum<uint16_t>>(OpKernelContext* ctx,
+                                                                const gsl::span<const int64_t>& axes_, int64_t keepdims_,
+                                                                bool noop_with_empty_axes);
+template void CommonReduce1Loop<ReduceAggregatorMean<uint16_t>>(OpKernelContext* ctx,
+                                                                 const gsl::span<const int64_t>& axes_, int64_t keepdims_,
+                                                                 bool noop_with_empty_axes);
+#endif
 
 }  // namespace onnxruntime

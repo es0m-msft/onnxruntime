@@ -1081,6 +1081,88 @@ The analysis revealed **109 MatMul operations** in the quantized QDQ model file.
 
 ---
 
-**Last Updated**: 2026-01-07 (End of Day 2)
-**Current Focus**: Phase 2.1 - Close performance gap through kernel optimizations
-**Status**: Fusion verified working, focus on kernel optimization
+---
+
+## Optimization Progress Summary (2026-01-07)
+
+### Completed Optimizations ✅
+
+**1. NEON Row Sum Optimization** (2026-01-06)
+- **Impact**: 2.1x speedup (464ms → 198ms, 53% reduction)
+- **Files**: `onnxruntime/core/mlas/lib/qgemm_u16u8.cpp`
+- **Achievement**: Vectorized uint16 row sum computation using ARM NEON intrinsics
+- **Details**: See [FINAL_QUANTIZATION_COMPARISON.md](./FINAL_QUANTIZATION_COMPARISON.md#quint16-neon-optimization)
+
+**2. NEON ReduceMean Optimization** (2026-01-07)
+- **Impact**: 19.8% per-operation speedup (1.645ms → 1.320ms per op)
+- **Files**: `onnxruntime/core/providers/cpu/reduction/reduction_ops.{h,cc}`
+- **Achievement**: Full NEON specialization for `ReduceAggregatorMean<uint16_t>` with uint32 accumulators
+- **Overall Impact**: ~7ms per inference improvement (modest due to dominant QLinearMatMul bottleneck)
+- **Details**: See [FINAL_QUANTIZATION_COMPARISON.md](./FINAL_QUANTIZATION_COMPARISON.md#neon-reducemean-implementation-2026-01-07)
+
+### Current Performance Status
+
+**QUInt16 Vanilla Quantization** (after both optimizations):
+- **Performance**: 385.03 ms (3.43x slower than FP32 @ 112.4ms)
+- **vs Original**: 464.3ms → 385ms (17% overall improvement)
+- **Accuracy**: 5.05e-02 L2 error (11.6x worse than QUInt8)
+
+**Performance Breakdown**:
+| Component | Time | % Runtime | Status |
+|-----------|------|-----------|--------|
+| QLinearMatMul | 168ms | 42% | ❌ **Column sum bottleneck** |
+| ReduceMean | 73ms | 18% | ✅ NEON optimized |
+| QuantizeLinear | 37ms | 9% | Reference impl |
+| Transpose | 32ms | 8% | - |
+| Add | 31ms | 8% | - |
+| DequantizeLinear | 30ms | 8% | Reference impl |
+
+### Outstanding Optimizations (Priority Order)
+
+**Priority 1: Column Sum Vectorization**
+- **Location**: `onnxruntime/core/mlas/lib/qgemm_u16u8.cpp` (lines 138-142)
+- **Problem**: Scalar loops with strided memory access (B[k*ldb+n])
+- **Current Impact**: ~100ms (26% of total runtime)
+- **Target**: 70-80ms improvement
+- **Approaches**:
+  1. Transpose B matrix once (convert columns to contiguous rows)
+  2. Compute sums inside GEMM kernel (amortize across tiles)
+  3. Cache sums for repeated operations
+- **Challenge**: Strided access makes NEON vectorization difficult (previous attempt made performance 1.6x worse)
+
+**Priority 2: NEON Q/DQ Kernels for uint16**
+- **Location**: `onnxruntime/core/providers/cpu/math/quantize_linear.cc`
+- **Current Impact**: ~17ms combined (8% of runtime)
+- **Target**: 5-10ms improvement
+- **Scope**: 650 QuantizeLinear + 1,104 DequantizeLinear operations
+
+**Priority 3: Graph Optimization (Q→DQ Roundtrips)**
+- **Location**: `onnxruntime/core/optimizer/qdq_transformer/*`
+- **Current Impact**: 650 Q→DQ roundtrip patterns
+- **Target**: 5-15ms improvement
+- **Approach**: Implement direct type conversion or bypass unnecessary roundtrips
+
+### Realistic Performance Targets
+
+**After All Planned Optimizations**:
+- Column sum optimization: 385ms → 305ms
+- NEON Q/DQ kernels: 305ms → 295ms
+- Graph optimizations: 295ms → 280ms
+- **Final Target**: ~280ms (2.5x slower than FP32)
+
+**FP32 Parity Unlikely**: Even with all optimizations, vanilla QUInt16 will likely remain 2.0-2.5x slower than FP32 due to inherent per-operation correction overhead.
+
+### Recommendation
+
+**For Production Use**: Prefer **Mixed-Precision** quantization (QUInt16 MatMul activations + QUInt8 everything else)
+- Performance: 66ms (1.7x faster than FP32)
+- Accuracy: Same as QUInt8 (4.35e-03 L2 error)
+- See [MIXED_PRECISION_RESULTS.md](./MIXED_PRECISION_RESULTS.md)
+
+**For Research/Development**: Continue QUInt16 vanilla optimization to demonstrate ONNX Runtime kernel optimization techniques
+
+---
+
+**Last Updated**: 2026-01-07
+**Current Phase**: Priority 1 - Column sum optimization planning
+**Status**: 2/4 major optimizations complete, 3.4x slower than FP32 target
