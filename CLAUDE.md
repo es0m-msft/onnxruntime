@@ -60,15 +60,14 @@ pip install --force-reinstall "${ORTSOURCEDIR}\build_arm64_u16u8\Release\Release
 ```powershell
 cd ${MODELDIR}
 ${ORTSOURCEDIR}\.venv_quant_test\Scripts\Activate.ps1
-python quantize_and_evaluate.py --model model/florence_v1_6_2_d3_tulrv6_multi_text_transformer.onnx --config model/florence_v1_6_2_d3_tulrv6_multi_text_transformer.json
+python ${ORTSOURCEDIR}\tools\python\perf_analysis\quantize_and_evaluate_with_profiling.py --model model/florence_v1_6_2_d3_tulrv6_multi_text_transformer.onnx --config model/florence_v1_6_2_d3_tulrv6_multi_text_transformer.json
 ```
 
 ### Important Notes
 1. **Use PowerShell** for activation scripts on Windows
-2. **Run from model directory** to avoid Python path issues with onnxruntime source directory
-3. **Copy quantize_and_evaluate.py** to model directory before running
-4. **Opset version**: Model can stay at opset 14 or 21 (both have same schema issue)
-5. **UTF-8 fix**: Replace Unicode checkmarks (✓) with [OK] in Python scripts for Windows console compatibility
+2. **Scripts location**: Performance analysis scripts are in `tools/python/perf_analysis/`
+3. **Opset version**: Model can stay at opset 14 or 21 (both have same schema issue)
+4. **UTF-8 fix**: Replace Unicode checkmarks (✓) with [OK] in Python scripts for Windows console compatibility
 
 ## Key Integration Changes
 
@@ -116,9 +115,10 @@ python quantize_and_evaluate.py --model model/florence_v1_6_2_d3_tulrv6_multi_te
 ```
 UnicodeEncodeError: 'charmap' codec can't encode character '\u2713'
 ```
-**Solution**: Replace UTF-8 characters in Python scripts:
+**Solution**: Replace UTF-8 characters in Python scripts (if needed):
 ```powershell
-(Get-Content quantize_and_evaluate.py -Encoding UTF8) -replace '✓', '[OK]' | Set-Content quantize_and_evaluate.py -Encoding UTF8
+cd ${ORTSOURCEDIR}\tools\python\perf_analysis
+(Get-Content script_name.py -Encoding UTF8) -replace '✓', '[OK]' | Set-Content script_name.py -Encoding UTF8
 ```
 
 ### Issue: ModuleNotFoundError for onnxruntime.capi
@@ -262,10 +262,10 @@ cd ${MODELDIR}
 ${ORTSOURCEDIR}\.venv_quant_test\Scripts\Activate.ps1
 
 # Quantize model (opset 14 works fine)
-python quantize_and_evaluate.py --model model/florence_v1_6_2_d3_tulrv6_multi_text_transformer.onnx --config model/florence_v1_6_2_d3_tulrv6_multi_text_transformer.json
+python ${ORTSOURCEDIR}\tools\python\perf_analysis\quantize_and_evaluate_with_profiling.py --model model/florence_v1_6_2_d3_tulrv6_multi_text_transformer.onnx --config model/florence_v1_6_2_d3_tulrv6_multi_text_transformer.json
 
 # Test with disabled optimizations (works!)
-python test_simple.py  # Uses ORT_DISABLE_ALL
+python ${ORTSOURCEDIR}\tools\python\perf_analysis\test_graph_optimization.py
 ```
 
 **After Schema Fix** (With fusion):
@@ -311,9 +311,9 @@ Need to investigate what OTHER operators in the fusion pattern might be rejectin
 - **Mixed-Precision (with LUT)**: 77.23 ms (lookup table overhead too high)
 
 ### Key Files
-- `C:\d\onnxruntime\quantize_mixed_precision.py` - Mixed-precision quantization script
-- `C:\d\onnxruntime\MIXED_PRECISION_RESULTS.md` - Detailed analysis and results
-- `C:\d\models\florence_v1_6_2_d3_tulrv6_multi_text_transformer\evaluate_model.py` - Performance evaluation script
+- `tools/python/perf_analysis/quantize_mixed_precision.py` - Mixed-precision quantization script
+- `MIXED_PRECISION_RESULTS.md` - Detailed analysis and results
+- `${MODELDIR}/evaluate_model.py` - Performance evaluation script
 
 ---
 
@@ -432,9 +432,9 @@ See [FINAL_QUANTIZATION_COMPARISON.md](./FINAL_QUANTIZATION_COMPARISON.md) for d
 
 ### Files and Scripts
 
-- **Diagnostic Script**: `C:\d\onnxruntime\diagnose_uint16_kernel_usage.py`
+- **Diagnostic Script**: `tools/python/perf_analysis/diagnose_uint16_kernel_usage.py`
 - **Test Model**: `quantized_models\florence_v1_6_2_d3_tulrv6_multi_text_transformer_quint16_full_qdq.onnx`
-- **Evaluation Script**: `quantize_and_evaluate_with_profiling.py`
+- **Evaluation Script**: `tools/python/perf_analysis/quantize_and_evaluate_with_profiling.py`
 - **Dispatcher Code (Modified)**: `onnxruntime/core/mlas/lib/qgemm_u16u8.cpp`
 - **NEON Kernel**: `onnxruntime/core/mlas/lib/arm64/QgemmU16U8KernelNeon.asm`
 
@@ -593,25 +593,9 @@ Current scalar code computes one element at a time. We need to:
 
 ### Next Steps
 
-#### 0. Helper Scripts for Development Workflow
-Create helper scripts to streamline the copy-and-invoke workflow:
+#### 0. Helper Script for Development Workflow
 
-**Script 1: `copy_scripts.ps1`** - Copy scripts from ONNX Runtime source to model directory
-```powershell
-# Usage: .\copy_scripts.ps1
-# Copies quantization and evaluation scripts to model directory
-param(
-    [string]$SourceDir = "C:\d\onnxruntime",
-    [string]$TargetDir = "C:\d\models\florence_v1_6_2_d3_tulrv6_multi_text_transformer"
-)
-
-Copy-Item "$SourceDir\quantize_and_evaluate_with_profiling.py" "$TargetDir\" -Force
-Copy-Item "$SourceDir\quantize_mixed_precision.py" "$TargetDir\" -Force
-Copy-Item "$TargetDir\evaluate_model.py" "$TargetDir\" -Force
-Write-Host "Scripts copied successfully!"
-```
-
-**Script 2: `run_quantization.ps1`** - Invoke quantization with proper environment
+**Script: `run_quantization.ps1`** - Invoke quantization with proper environment
 ```powershell
 # Usage: .\run_quantization.ps1 -QuantType mixed
 param(
@@ -620,8 +604,10 @@ param(
     [switch]$UseLUT
 )
 
+$OrtSourceDir = "C:\d\onnxruntime"
 $ModelDir = "C:\d\models\florence_v1_6_2_d3_tulrv6_multi_text_transformer"
-$VenvPython = "C:\d\onnxruntime\.venv_quant_test\Scripts\python.exe"
+$VenvPython = "$OrtSourceDir\.venv_quant_test\Scripts\python.exe"
+$ScriptDir = "$OrtSourceDir\tools\python\perf_analysis"
 
 cd $ModelDir
 
@@ -631,18 +617,20 @@ switch ($QuantType) {
         if ($UseLUT) {
             $Args += " --use-lookup-table"
         }
-        & $VenvPython quantize_mixed_precision.py $Args
+        & $VenvPython "$ScriptDir\quantize_mixed_precision.py" $Args
     }
     default {
-        & $VenvPython quantize_and_evaluate_with_profiling.py --model model/florence_v1_6_2_d3_tulrv6_multi_text_transformer.onnx --config model/florence_v1_6_2_d3_tulrv6_multi_text_transformer.json --quant-type $QuantType
+        & $VenvPython "$ScriptDir\quantize_and_evaluate_with_profiling.py" --model model/florence_v1_6_2_d3_tulrv6_multi_text_transformer.onnx --config model/florence_v1_6_2_d3_tulrv6_multi_text_transformer.json --quant-type $QuantType
     }
 }
 ```
 
+**Note**: Scripts are now located in `tools/python/perf_analysis/` and can be invoked directly without copying.
+
 #### 1. Code Review: Shared Code Analysis
 Use the code review agent to analyze common code patterns between:
-- `quantize_and_evaluate_with_profiling.py`
-- `quantize_mixed_precision.py`
+- `tools/python/perf_analysis/quantize_and_evaluate_with_profiling.py`
+- `tools/python/perf_analysis/quantize_mixed_precision.py`
 
 Focus on:
 - DummyCalibrationDataReader class (duplicated)
