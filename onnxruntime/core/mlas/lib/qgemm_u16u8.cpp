@@ -349,13 +349,19 @@ Return Value:
                     ZeroMode
                 );
 
+                // Ignore RowsHandled - kernel always processes 4 rows minimum
+                // Use CountM (actual row count) for post-processing
+                (void)RowsHandled;
+
                 // Apply output post-processing if specified
+                // BUGFIX (2026-01-09): Use CountM instead of RowsHandled to avoid buffer overrun
+                // The kernel always processes 4 rows minimum, but we may have fewer rows in the last tile
                 if (params->OutputProcessor != nullptr) {
                     params->OutputProcessor->Process(
                         C,
                         m,
                         n,
-                        RowsHandled,
+                        CountM,  // FIXED: Use actual row count, not kernel's RowsHandled
                         CountN,
                         ldc
                     );
