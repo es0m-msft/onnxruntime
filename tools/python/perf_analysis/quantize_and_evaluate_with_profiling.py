@@ -899,6 +899,8 @@ def main():
                        help="Comma-separated list of configs to test: base,qint8,qint8_perchan,qint16 (default: all if --test-configs, else base only)")
     parser.add_argument("--use-existing-models", action="store_true",
                        help="Use existing quantized models if available, skip quantization step")
+    parser.add_argument("--quantize-only", action="store_true",
+                       help="Only quantize the model, skip all evaluation and profiling")
 
     args = parser.parse_args()
 
@@ -940,15 +942,20 @@ def main():
     )
     print("[OK] Calibration data generated")
 
-    print(f"Generating {args.num_validation_samples} validation samples...")
-    validation_reader = DummyCalibrationDataReader(
-        args.model,
-        num_samples=args.num_validation_samples,
-        seed=args.seed + 1000,
-        model_description=model_description,
-    )
-    validation_samples = validation_reader.get_all_samples()
-    print("[OK] Validation data generated")
+    # Generate validation data (only used if not in quantize-only mode, but cheap to create)
+    if args.quantize_only:
+        print("[SKIP] Validation data generation (quantize-only mode)")
+        validation_samples = None
+    else:
+        print(f"Generating {args.num_validation_samples} validation samples...")
+        validation_reader = DummyCalibrationDataReader(
+            args.model,
+            num_samples=args.num_validation_samples,
+            seed=args.seed + 1000,
+            model_description=model_description,
+        )
+        validation_samples = validation_reader.get_all_samples()
+        print("[OK] Validation data generated")
 
     # Define all available configurations
     all_configs = {}
@@ -1062,27 +1069,6 @@ def main():
     model_name = Path(args.model).stem
     all_results = {}
 
-    # Evaluate FP32 baseline
-    print("\n" + "=" * 80)
-    print("EVALUATING FP32 BASELINE")
-    print("=" * 80)
-    print("\nEvaluating FP32 baseline model...")
-    fp32_outputs, _, fp32_timing, fp32_profile = evaluate_model_with_profiling(
-        args.model, validation_samples, enable_profiling=args.enable_profiling,
-        profile_prefix=f"{model_name}_fp32"
-    )
-    fp32_profile_analysis = analyze_profile(fp32_profile) if fp32_profile else {}
-    print("[OK] FP32 evaluation complete")
-    print_results("FP32", 0.0, fp32_timing, fp32_profile_analysis)
-
-    all_results["FP32"] = {
-        "relative_l2": 0.0,
-        "timing": fp32_timing,
-        "size_mb": get_model_size(args.model),
-        "profile_file": fp32_profile,
-        "profile_analysis": fp32_profile_analysis
-    }
-
     # Test each configuration
     for config_name, config in configs_to_test.items():
         print(f"\n{'=' * 80}")
@@ -1103,6 +1089,12 @@ def main():
                     print(f"\nUsing existing dynamic model: {dynamic_model_path}")
                 else:
                     quantize_to_dynamic(args.model, str(dynamic_model_path), config)
+
+                print(f"[OK] Dynamic quantized model created: {dynamic_model_path}")
+
+                # If quantize-only mode, skip evaluation
+                if args.quantize_only:
+                    continue
 
                 # Evaluate dynamic model
                 print(f"\nEvaluating dynamic model ({config_name})...")
@@ -1187,6 +1179,12 @@ def main():
                         # Normal quantization
                         quantize_to_qdq(args.model, str(qdq_model_path), calibration_reader, config)
 
+                print(f"[OK] QDQ quantized model created: {qdq_model_path}")
+
+                # If quantize-only mode, skip evaluation
+                if args.quantize_only:
+                    continue
+
                 # Evaluate QDQ model
                 print(f"\nEvaluating QDQ model ({config_name})...")
                 _, qdq_l2, qdq_timing, qdq_profile = evaluate_model_with_profiling(
@@ -1210,6 +1208,35 @@ def main():
             print(f"Error during quantization ({config_name}): {e}")
             import traceback
             traceback.print_exc()
+
+    # If quantize-only mode, exit early
+    if args.quantize_only:
+        print("\n" + "=" * 80)
+        print("QUANTIZATION COMPLETE (quantize-only mode)")
+        print("=" * 80)
+        print(f"\nQuantized models saved to: {output_dir}")
+        return 0
+
+    # Evaluate FP32 baseline
+    print("\n" + "=" * 80)
+    print("EVALUATING FP32 BASELINE")
+    print("=" * 80)
+    print("\nEvaluating FP32 baseline model...")
+    fp32_outputs, _, fp32_timing, fp32_profile = evaluate_model_with_profiling(
+        args.model, validation_samples, enable_profiling=args.enable_profiling,
+        profile_prefix=f"{model_name}_fp32"
+    )
+    fp32_profile_analysis = analyze_profile(fp32_profile) if fp32_profile else {}
+    print("[OK] FP32 evaluation complete")
+    print_results("FP32", 0.0, fp32_timing, fp32_profile_analysis)
+
+    all_results["FP32"] = {
+        "relative_l2": 0.0,
+        "timing": fp32_timing,
+        "size_mb": get_model_size(args.model),
+        "profile_file": fp32_profile,
+        "profile_analysis": fp32_profile_analysis
+    }
 
     # Print final comparison
     print("\n" + "=" * 80)
