@@ -237,9 +237,14 @@ Return Value:
         // These are used to compute the zero-point corrections:
         // (A - ZeroPointA) * (B - ZeroPointB) = A*B - A*ZeroPointB - B*ZeroPointA + ZeroPointA*ZeroPointB
 
-        constexpr size_t StrideM = 4;  // Process 4 rows at a time (from kernel)
-        constexpr size_t StrideN = 16; // Process 16 columns at a time (from kernel)
-        constexpr size_t PackedK = 8;  // K dimension packing (8 elements per block)
+        // PERFORMANCE OPTIMIZATION (2026-01-08): Increased tile sizes to match QUInt8 approach
+        // This reduces the number of tile iterations and amortizes column sum computation overhead
+        // Previous: StrideM=4 resulted in M/4 iterations (e.g., 77/4 = 20 iterations)
+        // Current: StrideM=24 results in M/24 iterations (e.g., 77/24 = 4 iterations)
+        // Expected speedup: 2-3x due to reduced overhead
+        constexpr size_t StrideM = 24;  // Process 24 rows at a time (increased from 4, matches QUInt8)
+        constexpr size_t StrideN = 128; // Process 128 columns at a time (increased from 16, matches QUInt8)
+        constexpr size_t PackedK = 8;   // K dimension packing (8 elements per block)
 
         const size_t PackedCountK = (K + PackedK - 1) / PackedK;
 
@@ -254,9 +259,15 @@ Return Value:
             AllRowSums[m] = ComputeRowSumNeon(A + m * lda, K);
         }
 
-        // Pre-compute ALL column sums once
-        // Note: Using scalar code for column sums because strided memory access
-        // pattern doesn't benefit from NEON vectorization (causes cache misses)
+        // PERFORMANCE NOTE: Column sum computation uses SCALAR code intentionally
+        //
+        // NEON optimization was tested but does NOT improve performance due to:
+        // - Column data is NOT cache-aligned (row-major matrix layout)
+        // - Memory stride between column elements = ldb (typically 768+ bytes)
+        // - Large memory distances cause cache misses that negate SIMD benefits
+        // - Scalar code performs equally well or better in this case
+        //
+        // See: PERF_TEST_RESULTS.md for benchmark evidence
         std::vector<int32_t> AllColumnSums(N);
         for (size_t n = 0; n < N; n++) {
             int32_t col_sum = 0;

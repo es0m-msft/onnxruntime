@@ -326,6 +326,49 @@ MlasDequantizeLinearU8Kernel(
     MlasDequantizeLinearRefImpl(Input, Output, N, Scale, ZeroPoint);
 }
 
+void
+MLASCALL
+MlasDequantizeLinearU16Kernel(
+    const uint16_t* Input,
+    float* Output,
+    size_t N,
+    float Scale,
+    uint16_t ZeroPoint
+    )
+{
+    const float32x4_t ScaleVector = MlasBroadcastFloat32x4(Scale);
+    const uint16x8_t ZeroPointVector = vdupq_n_u16(ZeroPoint); // Broadcast ZeroPoint to 8 uint16s
+
+    while (N >= 8) {
+        // Load a vector of 8 uint16s: [0 ... 7]
+        uint16x8_t VectorU16 = vld1q_u16(Input);
+
+        // Subtract the zero-point in uint16 domain, then reinterpret as int16
+        // The subtraction is done in uint16, but the result can be negative (wraps around)
+        // When reinterpreted as int16, the two's complement gives us the correct signed value
+        int16x8_t VectorS16 = vreinterpretq_s16_u16(vsubq_u16(VectorU16, ZeroPointVector));
+
+        // Sign-extend into 2 vectors of 4 int32s
+        int32x4_t VectorS32_0 = vmovl_s16(vget_low_s16(VectorS16));  // [0 ... 3]
+        int32x4_t VectorS32_1 = vmovl_s16(vget_high_s16(VectorS16)); // [4 ... 7]
+
+        // Cast each int32x4 to float and multiply by the scale vector.
+        float32x4_t VectorF32_0 = vmulq_f32(vcvtq_f32_s32(VectorS32_0), ScaleVector);
+        float32x4_t VectorF32_1 = vmulq_f32(vcvtq_f32_s32(VectorS32_1), ScaleVector);
+
+        // Store each float32x4 into the output.
+        vst1q_f32(Output + 0, VectorF32_0);
+        vst1q_f32(Output + 4, VectorF32_1);
+
+        N -= 8;
+        Input += 8;
+        Output += 8;
+    }
+
+    // Handle leftover elements (< 8) with the scalar reference implementation.
+    MlasDequantizeLinearRefImpl(Input, Output, N, Scale, ZeroPoint);
+}
+
 template<>
 void
 MLASCALL
@@ -352,6 +395,20 @@ MlasDequantizeLinear<uint8_t>(
     )
 {
     MlasDequantizeLinearU8Kernel(Input, Output, N, Scale, ZeroPoint);
+}
+
+template<>
+void
+MLASCALL
+MlasDequantizeLinear<uint16_t>(
+    const uint16_t* Input,
+    float* Output,
+    size_t N,
+    float Scale,
+    uint16_t ZeroPoint
+    )
+{
+    MlasDequantizeLinearU16Kernel(Input, Output, N, Scale, ZeroPoint);
 }
 #else
 // Implementation that uses the scalar reference implementation.

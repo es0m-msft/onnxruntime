@@ -421,6 +421,10 @@ def evaluate_model_with_profiling(
     # CRITICAL: Enable all graph optimizations to fuse QDQ patterns into QLinearMatMul
     options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
 
+    # Enable Q/DQ cleanup to eliminate redundant QuantizeLinear->DequantizeLinear roundtrips
+    # This can provide 5-10% performance improvement by eliminating overhead
+    options.add_session_config_entry("session.enable_quant_qdq_cleanup", "1")
+
     if enable_profiling:
         options.enable_profiling = True
         options.profile_file_prefix = profile_prefix
@@ -893,6 +897,8 @@ def main():
                        help="Test multiple quantization configurations (QInt8, QInt16)")
     parser.add_argument("--configs", type=str, default=None,
                        help="Comma-separated list of configs to test: base,qint8,qint8_perchan,qint16 (default: all if --test-configs, else base only)")
+    parser.add_argument("--use-existing-models", action="store_true",
+                       help="Use existing quantized models if available, skip quantization step")
 
     args = parser.parse_args()
 
@@ -1091,7 +1097,12 @@ def main():
             if config.get("_is_dynamic", False):
                 # Dynamic quantization (no calibration needed)
                 dynamic_model_path = output_dir / f"{model_name}_{config_name}.onnx"
-                quantize_to_dynamic(args.model, str(dynamic_model_path), config)
+
+                # Check if model exists and we should use it
+                if args.use_existing_models and dynamic_model_path.exists():
+                    print(f"\nUsing existing dynamic model: {dynamic_model_path}")
+                else:
+                    quantize_to_dynamic(args.model, str(dynamic_model_path), config)
 
                 # Evaluate dynamic model
                 print(f"\nEvaluating dynamic model ({config_name})...")
@@ -1114,62 +1125,67 @@ def main():
                 }
             else:
                 # QDQ quantization (static)
-                calibration_reader.rewind()
 
-                # Check if we should use two-stage TensorQuantOverrides (FIXED approach)
-                if config.get("_use_two_stage_uint16", False):
-                    # Mixed-precision using two-stage TensorQuantOverrides
-                    # This is the CORRECT implementation that finds ALL MatMul activations
-                    print(f"\n  Using two-stage quantization for full uint16 range...")
-                    quantize_mixed_precision_full_uint16(
-                        args.model,
-                        str(qdq_model_path),
-                        calibration_reader,
-                        config
-                    )
-
-                # Check if we should use TensorQuantOverrides for mixed-precision (OLD broken approach)
-                elif config.get("_use_tensor_overrides", False):
-                    # Mixed-precision using TensorQuantOverrides - OLD APPROACH (only finds 73 tensors)
-                    print(f"\n  WARNING: Using OLD TensorQuantOverrides approach (only finds ~73 tensors)")
-                    print(f"  Consider using _use_two_stage_uint16 instead for better coverage")
-                    tensor_overrides = create_tensor_quant_overrides_for_matmul(args.model)
-                    print(f"  [OK] Created overrides for {len(tensor_overrides)} tensors")
-
-                    # Add to extra_options
-                    config_with_overrides = config.copy()
-                    extra_opts = config_with_overrides.get("extra_options", {}).copy()
-                    extra_opts["TensorQuantOverrides"] = tensor_overrides
-                    config_with_overrides["extra_options"] = extra_opts
-
-                    # Quantize with overrides
-                    print(f"  Quantizing with uint16 overrides for MatMul activations...")
-                    quantize_to_qdq(args.model, str(qdq_model_path), calibration_reader, config_with_overrides)
-
-                # Check if this is mixed-precision (post-processing approach)
-                elif config.get("_is_mixed_precision", False):
-                    # Mixed-precision: Two-step process (old approach)
-                    scale_strategy = config.get("_scale_strategy", "no_adjust")
-
-                    # Step 1: Quantize to QUInt8
-                    quint8_temp_path = output_dir / f"{model_name}_{config_name}_quint8_temp.onnx"
-                    print(f"\n  Step 1: Quantizing to QUInt8 (temporary)...")
-                    quantize_to_qdq(args.model, str(quint8_temp_path), calibration_reader, config)
-
-                    # Step 2: Upgrade MatMul activations to QUInt16
-                    print(f"  Step 2: Converting to mixed-precision (strategy: {scale_strategy})...")
-                    create_mixed_precision_model(
-                        str(quint8_temp_path),
-                        str(qdq_model_path),
-                        scale_strategy=scale_strategy
-                    )
-
-                    # Clean up temporary file
-                    if quint8_temp_path.exists():
-                        quint8_temp_path.unlink()
+                # Check if model exists and we should use it
+                if args.use_existing_models and qdq_model_path.exists():
+                    print(f"\nUsing existing QDQ model: {qdq_model_path}")
                 else:
-                    # Normal quantization
-                    quantize_to_qdq(args.model, str(qdq_model_path), calibration_reader, config)
+                    calibration_reader.rewind()
+
+                    # Check if we should use two-stage TensorQuantOverrides (FIXED approach)
+                    if config.get("_use_two_stage_uint16", False):
+                        # Mixed-precision using two-stage TensorQuantOverrides
+                        # This is the CORRECT implementation that finds ALL MatMul activations
+                        print(f"\n  Using two-stage quantization for full uint16 range...")
+                        quantize_mixed_precision_full_uint16(
+                            args.model,
+                            str(qdq_model_path),
+                            calibration_reader,
+                            config
+                        )
+
+                    # Check if we should use TensorQuantOverrides for mixed-precision (OLD broken approach)
+                    elif config.get("_use_tensor_overrides", False):
+                        # Mixed-precision using TensorQuantOverrides - OLD APPROACH (only finds 73 tensors)
+                        print(f"\n  WARNING: Using OLD TensorQuantOverrides approach (only finds ~73 tensors)")
+                        print(f"  Consider using _use_two_stage_uint16 instead for better coverage")
+                        tensor_overrides = create_tensor_quant_overrides_for_matmul(args.model)
+                        print(f"  [OK] Created overrides for {len(tensor_overrides)} tensors")
+
+                        # Add to extra_options
+                        config_with_overrides = config.copy()
+                        extra_opts = config_with_overrides.get("extra_options", {}).copy()
+                        extra_opts["TensorQuantOverrides"] = tensor_overrides
+                        config_with_overrides["extra_options"] = extra_opts
+
+                        # Quantize with overrides
+                        print(f"  Quantizing with uint16 overrides for MatMul activations...")
+                        quantize_to_qdq(args.model, str(qdq_model_path), calibration_reader, config_with_overrides)
+
+                    # Check if this is mixed-precision (post-processing approach)
+                    elif config.get("_is_mixed_precision", False):
+                        # Mixed-precision: Two-step process (old approach)
+                        scale_strategy = config.get("_scale_strategy", "no_adjust")
+
+                        # Step 1: Quantize to QUInt8
+                        quint8_temp_path = output_dir / f"{model_name}_{config_name}_quint8_temp.onnx"
+                        print(f"\n  Step 1: Quantizing to QUInt8 (temporary)...")
+                        quantize_to_qdq(args.model, str(quint8_temp_path), calibration_reader, config)
+
+                        # Step 2: Upgrade MatMul activations to QUInt16
+                        print(f"  Step 2: Converting to mixed-precision (strategy: {scale_strategy})...")
+                        create_mixed_precision_model(
+                            str(quint8_temp_path),
+                            str(qdq_model_path),
+                            scale_strategy=scale_strategy
+                        )
+
+                        # Clean up temporary file
+                        if quint8_temp_path.exists():
+                            quint8_temp_path.unlink()
+                    else:
+                        # Normal quantization
+                        quantize_to_qdq(args.model, str(qdq_model_path), calibration_reader, config)
 
                 # Evaluate QDQ model
                 print(f"\nEvaluating QDQ model ({config_name})...")
