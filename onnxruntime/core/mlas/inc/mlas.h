@@ -656,6 +656,47 @@ struct MLAS_GEMM_U16U8_DATA_PARAMS {
 };
 
 /**
+ * @brief Computes the buffer size required to pack B matrix for QUInt16×QUInt8 GEMM.
+ *
+ * This function calculates the number of bytes needed to store the packed B matrix
+ * (uint8_t weights) including column sums for zero-point compensation.
+ *
+ * @param [IN]  N  Number of columns of matrix B
+ * @param [IN]  K  Number of rows of matrix B
+ * @return         Size in bytes required for packed buffer
+ */
+size_t
+MLASCALL
+MlasGemmU16U8PackBSize(
+    size_t N,
+    size_t K
+    );
+
+/**
+ * @brief Packs B matrix for QUInt16×QUInt8 GEMM operations.
+ *
+ * This function packs the B matrix (uint8_t weights) into an optimized layout
+ * for faster inference. The packed buffer should be allocated using
+ * MlasGemmU16U8PackBSize(). Packing is done once at model load time to eliminate
+ * runtime packing overhead.
+ *
+ * @param [IN]  N        Number of columns of matrix B
+ * @param [IN]  K        Number of rows of matrix B
+ * @param [IN]  B        Pointer to B matrix (column-major layout)
+ * @param [IN]  ldb      Leading dimension of B (stride between rows)
+ * @param [OUT] PackedB  Pointer to packed buffer (allocated by caller)
+ */
+void
+MLASCALL
+MlasGemmU16U8PackB(
+    size_t N,
+    size_t K,
+    const uint8_t* B,
+    size_t ldb,
+    void* PackedB
+    );
+
+/**
  * @brief Batched quantized GEMM for QUInt16 activations x QUInt8 weights.
  *
  * This routine performs quantized matrix multiplication where matrix A uses

@@ -29,8 +29,10 @@ class MatMulIntegerBase : public OpKernel {
 
       auto a_elem_type = Node().InputDefs()[GetAIdx()]->TypeAsProto()->tensor_type().elem_type();
       bool a_is_signed = ONNX_NAMESPACE::TensorProto_DataType_INT8 == a_elem_type;
+      bool a_is_uint16 = ONNX_NAMESPACE::TensorProto_DataType_UINT16 == a_elem_type;
 
       b_is_signed_ = tensor.IsDataType<int8_t>();
+      bool b_is_uint8 = tensor.IsDataType<uint8_t>();
 
       size_t K = static_cast<size_t>(b_shape_[0]);
       size_t N = static_cast<size_t>(b_shape_[1]);
@@ -42,7 +44,15 @@ class MatMulIntegerBase : public OpKernel {
         std::swap(K, N);
         b_data = quantization::TransPoseInputData(b_data, b_trans_buffer, alloc, N, K);
       }
-      const size_t packed_b_size = MlasGemmPackBSize(N, K, a_is_signed, b_is_signed_);
+
+      size_t packed_b_size = 0;
+      // Check if this is QUInt16 × QUInt8 mixed precision case
+      if (a_is_uint16 && b_is_uint8) {
+        packed_b_size = MlasGemmU16U8PackBSize(N, K);
+      } else {
+        packed_b_size = MlasGemmPackBSize(N, K, a_is_signed, b_is_signed_);
+      }
+
       if (packed_b_size == 0) {
         return Status::OK();
       }
@@ -52,7 +62,13 @@ class MatMulIntegerBase : public OpKernel {
       // buffer memory and we don not want it uninitialized and generate different hashes
       // if and when we try to cache this pre-packed buffer for sharing between sessions.
       memset(packed_b_.get(), 0, packed_b_size);
-      MlasGemmPackB(N, K, b_data, N, a_is_signed, b_is_signed_, packed_b_.get());
+
+      // Pack B matrix using appropriate function
+      if (a_is_uint16 && b_is_uint8) {
+        MlasGemmU16U8PackB(N, K, b_data, N, packed_b_.get());
+      } else {
+        MlasGemmPackB(N, K, b_data, N, a_is_signed, b_is_signed_, packed_b_.get());
+      }
 
       bool share_prepacked_weights = (prepacked_weights != nullptr);
       if (share_prepacked_weights) {

@@ -251,6 +251,119 @@ Return Value:
 #endif  // MLAS_TARGET_ARM64 || MLAS_TARGET_ARM64EC
 
 //
+// Constants for U16U8 GEMM
+//
+
+// Thread stride alignment (matching QUInt8 infrastructure)
+constexpr size_t MLAS_QGEMM_U16U8_STRIDEN_THREAD_ALIGN = 16;
+
+//
+// PrePack API for U16U8 GEMM
+//
+
+size_t
+MLASCALL
+MlasGemmU16U8PackBSize(
+    size_t N,
+    size_t K
+)
+/*++
+
+Routine Description:
+
+    This routine computes the number of bytes required to pack the B matrix
+    (uint8_t weights) for QUInt16×QUInt8 GEMM operations.
+
+    The packed buffer format (matching QUInt8):
+    [ColumnSums (AlignedN * int32_t)] [PackedMatrix (N * K * uint8_t)]
+
+Arguments:
+
+    N - Supplies the number of columns of matrix B.
+    K - Supplies the number of rows of matrix B.
+
+Return Value:
+
+    Returns the number of bytes required to pack the matrix.
+
+--*/
+{
+    // Align N to thread stride boundary (matching QUInt8)
+    const size_t AlignedN = (N + MLAS_QGEMM_U16U8_STRIDEN_THREAD_ALIGN - 1) & ~(MLAS_QGEMM_U16U8_STRIDEN_THREAD_ALIGN - 1);
+
+    // Calculate size: column sums + packed matrix
+    const size_t ColumnSumBytes = AlignedN * sizeof(int32_t);
+    const size_t PackedMatrixBytes = N * K * sizeof(uint8_t);
+    const size_t TotalBytes = ColumnSumBytes + PackedMatrixBytes;
+
+    // Align total size to preferred buffer alignment
+    const size_t BufferAlignment = MlasGetPreferredBufferAlignment();
+    const size_t AlignedTotalBytes = (TotalBytes + BufferAlignment - 1) & ~(BufferAlignment - 1);
+
+    return AlignedTotalBytes;
+}
+
+void
+MLASCALL
+MlasGemmU16U8PackB(
+    size_t N,
+    size_t K,
+    const uint8_t* B,
+    size_t ldb,
+    void* PackedB
+)
+/*++
+
+Routine Description:
+
+    This routine packs the B matrix (uint8_t weights) for QUInt16×QUInt8 GEMM
+    operations. The packed buffer was allocated using MlasGemmU16U8PackBSize.
+
+    The packed format (matching QUInt8):
+    [ColumnSums (AlignedN * int32_t)] [PackedMatrix (N * K * uint8_t)]
+
+    Column sums are precomputed during packing for zero-overhead inference.
+
+Arguments:
+
+    N - Supplies the number of columns of matrix B.
+    K - Supplies the number of rows of matrix B.
+    B - Supplies the address of matrix B (column-major layout).
+    ldb - Supplies the leading dimension of matrix B (stride between rows).
+    PackedB - Supplies the address of the packed buffer.
+
+Return Value:
+
+    None.
+
+--*/
+{
+#if defined(MLAS_TARGET_ARM64) || defined(MLAS_TARGET_ARM64EC)
+
+    // Align N to thread stride boundary (matching QUInt8)
+    const size_t AlignedN = (N + MLAS_QGEMM_U16U8_STRIDEN_THREAD_ALIGN - 1) & ~(MLAS_QGEMM_U16U8_STRIDEN_THREAD_ALIGN - 1);
+
+    // Setup pointers: column sums first, then packed matrix
+    int32_t* PackedColumnSumBuffer = static_cast<int32_t*>(PackedB);
+    uint8_t* PackedMatrix = reinterpret_cast<uint8_t*>(PackedColumnSumBuffer + AlignedN);
+
+    // Initialize column sums to zero
+    std::fill_n(PackedColumnSumBuffer, AlignedN, 0);
+
+    // Pack B matrix and compute column sums using optimized function
+    PackBMatrixU16U8(PackedMatrix, B, N, K, ldb, PackedColumnSumBuffer);
+
+#else
+    // Non-ARM64 platforms: not supported yet
+    MLAS_UNREFERENCED_PARAMETER(N);
+    MLAS_UNREFERENCED_PARAMETER(K);
+    MLAS_UNREFERENCED_PARAMETER(B);
+    MLAS_UNREFERENCED_PARAMETER(ldb);
+    MLAS_UNREFERENCED_PARAMETER(PackedB);
+#endif
+}
+
+//
 // U16U8 GEMM operation implementation
 //
 
@@ -362,33 +475,16 @@ Return Value:
         std::vector<int32_t> AllColumnSums(N);
 
         if (BIsPacked) {
-            // B is already pre-packed (PrePack phase)
-            // Layout: B[n * K + k] for column-by-column contiguous data
-            PackedB = B;
+            // PERFORMANCE OPTIMIZATION (2026-01-10 - Option 2): PrePack with precomputed column sums
+            // B is already pre-packed with format: [ColumnSums][PackedMatrix]
+            // Extract precomputed column sums (zero overhead)
+            const size_t AlignedN = (N + MLAS_QGEMM_U16U8_STRIDEN_THREAD_ALIGN - 1) & ~(MLAS_QGEMM_U16U8_STRIDEN_THREAD_ALIGN - 1);
 
-            // Compute column sums from pre-packed contiguous data (NEON optimized)
-            for (size_t n = 0; n < N; n++) {
-                const uint8_t* col_data = PackedB + n * K;
-                uint32x4_t col_sum_vec = vdupq_n_u32(0);
-                size_t k = 0;
+            const int32_t* PackedColumnSumBuffer = reinterpret_cast<const int32_t*>(B);
+            PackedB = reinterpret_cast<const uint8_t*>(PackedColumnSumBuffer + AlignedN);
 
-                // Process 16 elements at a time
-                for (; k + 16 <= K; k += 16) {
-                    uint8x16_t data = vld1q_u8(col_data + k);
-                    col_sum_vec = vpadalq_u16(col_sum_vec, vpaddlq_u8(data));
-                }
-
-                // Horizontal sum
-                uint32x2_t sum_pair = vadd_u32(vget_low_u32(col_sum_vec), vget_high_u32(col_sum_vec));
-                int32_t col_sum = static_cast<int32_t>(vget_lane_u32(sum_pair, 0) + vget_lane_u32(sum_pair, 1));
-
-                // Remaining elements
-                for (; k < K; k++) {
-                    col_sum += static_cast<int32_t>(col_data[k]);
-                }
-
-                AllColumnSums[n] = col_sum;
-            }
+            // Copy precomputed column sums
+            std::copy_n(PackedColumnSumBuffer, N, AllColumnSums.data());
         } else {
             // B is NOT packed - pack it now and compute column sums
             PackedBBuffer.resize(N * K);
