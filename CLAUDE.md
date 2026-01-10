@@ -12,6 +12,43 @@
 - To use PowerShell, invoke it explicitly: `powershell -NoProfile -Command "..."`
 - Path formats: Git Bash uses `/` (e.g., `/c/git/repo`), Windows uses `\` (e.g., `C:\git\repo`)
 
+## Quick Start: Automated Development Workflow
+
+**For rapid development and testing, use these single-line automation scripts:**
+
+### 1. Build, Deploy, and Test in One Command
+```powershell
+# After making code changes, rebuild everything and test
+${ORTSOURCEDIR}\test_changes.ps1
+```
+
+### 2. Build and Deploy Only
+```powershell
+# Rebuild C++, rebuild Python wheel, install in venv
+${ORTSOURCEDIR}\build_and_deploy.ps1
+
+# Optional: Skip specific steps
+${ORTSOURCEDIR}\build_and_deploy.ps1 -SkipBuild    # Only wheel and install
+${ORTSOURCEDIR}\build_and_deploy.ps1 -SkipWheel    # Only C++ build
+${ORTSOURCEDIR}\build_and_deploy.ps1 -SkipInstall  # Build but don't install
+```
+
+### 3. Compare Model Performance
+```powershell
+# Compare original vs fixed model variants
+${ORTSOURCEDIR}\tools\python\perf_analysis\compare_models.ps1
+```
+
+### 4. Diagnose QDQ Fusion Issues
+```bash
+# Analyze QDQ fusion in quantized models
+cd ${MODELDIR}
+${ORTSOURCEDIR}\.venv_quant_test\Scripts\python.exe ${ORTSOURCEDIR}\tools\python\perf_analysis\diagnose_qdq_fusion.py embimg_c.quant.onnx
+```
+
+**See the [QUInt16 Performance Investigation Plan](C:\Users\ersomme\.claude\plans\eager-toasting-pearl.md) for detailed script documentation and usage.**
+
+---
 
 ## Building ONNX Runtime ARM64 with QUInt16×QUInt8 Support
 
@@ -204,120 +241,6 @@ ModuleNotFoundError: No module named 'onnxruntime.capi'
 
 ---
 
-## Current Status (2026-01-05)
-
-### What's Working ✓
-- ✓ ARM64 NEON kernel (`MlasGemmU16U8KernelNeon`) is implemented and compiled
-- ✓ MLAS dispatcher layer (`qgemm_u16u8.cpp`) is integrated
-- ✓ QLinearMatMul operator registered for uint16_t (opset 10-20 and 21)
-- ✓ Graph fusion rules enabled for 16-bit types (`allow_16bit = true`)
-- ✓ QDQ quantization creates valid uint16 models
-- ✓ Models load and run with **ORT_DISABLE_ALL** and **ORT_ENABLE_BASIC** optimization levels
-- ✓ DQ→MatMul→Q path executes successfully on ARM64
-
-### Opset Version Testing Results
-
-**Key Finding**: Opset version does NOT matter for the schema validation issue.
-
-| Opset | Q/DQ Domain | ORT_DISABLE_ALL | ORT_ENABLE_EXTENDED | Notes |
-|-------|-------------|-----------------|---------------------|-------|
-| 14 | com.microsoft | ✓ Runs | ✗ Schema error | Original model |
-| 21 | onnx | ✓ Runs | ✗ Schema error | Converted model |
-
-**Conclusion**:
-- Both opset 14 and 21 work equally well with disabled optimizations
-- Both fail with same schema validation error when fusion is enabled
-- **Recommendation: Stay with opset 14** (no conversion needed)
-
-### Remaining Issue: ONNX Schema Validation ✗
-
-**Problem**: Graph optimization fusion (ORT_ENABLE_EXTENDED/ALL) fails with:
-```
-InvalidGraph: Type 'tensor(uint16)' of input parameter ... of operator (QLinearMatMul) ... is invalid
-```
-
-**Root Cause**: The official ONNX OpSchema for QLinearMatMul doesn't allow uint16 types. When the QDQ transformer tries to fuse DQ→MatMul→Q patterns into QLinearMatMul, the schema validator rejects the uint16 tensors before the kernel can even be invoked.
-
-**Evidence**:
-```
-Optimization Level        | Result
---------------------------|------------------------------------------
-ORT_DISABLE_ALL          | ✓ Model loads & runs (no fusion attempted)
-ORT_ENABLE_BASIC         | ✓ Model loads & runs (no fusion attempted)
-ORT_ENABLE_EXTENDED      | ✗ Schema validation error (fusion attempted)
-ORT_ENABLE_ALL           | ✗ Schema validation error (fusion attempted)
-```
-
-**Graph State Analysis**:
-- Quantized model (QDQ format): 876 DequantizeLinear + 109 MatMul + 650 QuantizeLinear
-- After fusion attempt: QDQ transformer creates QLinearMatMul nodes
-- Schema validator: Rejects uint16 inputs before kernel execution
-- Result: Graph optimization fails, model cannot load
-
-### Performance Impact
-
-**Current State** (using DQ→MatMul→Q with ORT_DISABLE_ALL):
-- Model runs but **doesn't use QLinearMatMul kernel**
-- Performance expected: **~123ms** (2.6x slower than FP32 baseline of 47.7ms)
-- No benefit from the NEON kernel integration
-- Still using FP32 computation with quantization overhead
-
-**After Schema Fix** (with QLinearMatMul fusion enabled):
-- Expected performance: **~20-30ms** (similar to Dynamic QUInt8 at 20.7ms)
-- **~5-6x speedup** over DQ→MatMul→Q approach
-- **~2.4x speedup** over FP32 baseline
-- Direct uint16 NEON kernel execution
-
-### Solution Path: Custom OpSchema Registration
-
-The ONNX Runtime schema system allows custom operator schemas that extend or override the official ONNX specs. We need to register a custom schema for QLinearMatMul that allows uint16 types.
-
-**Strategy Options**:
-
-#### Option 1: Override ONNX QLinearMatMul Schema (Recommended)
-Register a custom OpSchema that extends the official schema to allow uint16 types.
-
-**Files to check**:
-- `onnxruntime/core/graph/contrib_ops/quantization_defs.cc` - Contains QLinear operator schemas
-- `onnxruntime/core/graph/contrib_ops/internal_nhwc_onnx_schemas.cc` - Reference for ONNX operator override pattern
-- `onnxruntime/core/graph/schema_registry.cc` - Schema registration mechanism
-
-#### Option 2: Use Custom Domain
-Move QLinearMatMul with uint16 support to `com.microsoft` domain (like Q/DQ operators in opset <21).
-
-**Pros**: Cleaner separation, no ONNX schema override
-**Cons**: Requires modifying QDQ transformer to recognize custom domain, more complex
-
-#### Option 3: Disable Schema Validation (Not Recommended)
-Add session option to bypass schema validation.
-
-**Pros**: Quick workaround
-**Cons**: Unsafe, disables all schema checks, not a proper solution
-
-### Next Steps
-
-1. **Implement Custom OpSchema** (Option 1)
-   - Study existing schema registration in `quantization_defs.cc`
-   - Create override schema for QLinearMatMul with uint16 support
-   - Add type constraints: T1 and T3 allow tensor(uint16)
-   - Test that schema allows graph optimization to proceed
-
-2. **Verify Fusion Works**
-   - Run quantized model with ORT_ENABLE_EXTENDED
-   - Confirm QLinearMatMul nodes are created and validated
-   - Check optimized graph contains QLinearMatMul instead of DQ→MatMul→Q
-
-3. **Performance Testing**
-   - Benchmark with QLinearMatMul fusion enabled
-   - Verify NEON kernel is invoked (can add logging)
-   - Measure inference time on Florence model
-   - Confirm ~20-30ms performance target
-
-4. **Documentation**
-   - Document schema registration pattern for future custom types
-   - Update integration guide with complete end-to-end workflow
-   - Add troubleshooting section for schema validation issues
-
 ### Testing Commands
 
 **Current Working State** (Without fusion):
@@ -337,33 +260,6 @@ python ${ORTSOURCEDIR}\tools\python\perf_analysis\test_graph_optimization.py
 # Same commands, but model should load with ORT_ENABLE_EXTENDED
 # and show performance improvement from ~123ms to ~20-30ms
 ```
-
-### Key Insight
-
-The kernel implementation is **100% complete and working**. The only blocker is a schema validation check that happens *before* the kernel is ever invoked. Once we register a custom schema that allows uint16 for QLinearMatMul, the entire integration will work end-to-end and deliver the expected ~5-6x performance improvement.
-
-## Latest Investigation (2026-01-05)
-
-### Schema Patching Status
-✓ ONNX QLinearMatMul opset 21 - Added uint16 to T1, T2, T3
-✓ ONNX QLinearMatMul opset 10 (old.cc) - Added uint16 to T1, T2, T3
-✓ ONNX QuantizeLinear opset 13 (old.cc) - Added uint16 to T2
-✓ ONNX DequantizeLinear opset 13 (old.cc) - Added uint16 to T
-✓ MS domain QuantizeLinear opset 1 - ALREADY has uint16 support
-✓ MS domain DequantizeLinear opset 1 - ALREADY has uint16 support
-
-### Remaining Error
-Despite all schemas supporting uint16, still getting:
-```
-Type 'tensor(uint16)' of input parameter (/lang_encoder/embeddings/LayerNorm/Add_1_output_0_QuantizeLinear_Output) of operator...
-```
-
-The error message is incomplete - it doesn't say WHICH operator is rejecting the uint16 input.
-
-### Next Steps
-Need to investigate what OTHER operators in the fusion pattern might be rejecting uint16 types. The error occurs during graph optimization, suggesting an intermediate operator (not Q/DQ/QLinearMatMul) doesn't support uint16.
-
----
 
 ## Mixed-Precision Quantization Results (2026-01-06)
 
@@ -457,19 +353,6 @@ The model structure is correct, all operations are quantized, and QLinearMatMul 
 
 ### Optimization Solution: NEON-Accelerated Row Sum
 
-**What was implemented**:
-- Created `ComputeRowSumNeon()` using ARM NEON intrinsics (processes 8 elements per iteration)
-- Vectorized uint16 row sum computation in `qgemm_u16u8.cpp`
-
-**What was tried and reverted**:
-- NEON column sum → made performance 1.6x WORSE due to strided memory access
-- **Key lesson**: Memory access patterns matter more than SIMD width
-
-**Performance results**:
-- **Original (scalar)**: 422ms (7.7x slower than FP32)
-- **After NEON row sum**: 198ms (3.6x slower than FP32)
-- **Improvement**: 2.1x speedup, 224ms saved (53% reduction)
-
 **Remaining bottlenecks**:
 1. Column sum computation: ~100ms (50% of runtime) - strided access prevents NEON optimization
 2. ReduceMean operator: ~30ms (15% of runtime) - no optimized uint16 kernel
@@ -508,127 +391,17 @@ See [FINAL_QUANTIZATION_COMPARISON.md](./FINAL_QUANTIZATION_COMPARISON.md) for d
 
 ### Critical Discovery: Scalar Sum Computation Bottleneck
 
-**Status**: ⚠️ **PARTIALLY ADDRESSED** (Row sums optimized, column sums cannot be optimized)
-
-**Update 2026-01-08**: Row sum NEON optimization implemented and working (~8x speedup). Column sum NEON optimization tested but does NOT improve performance due to cache alignment issues with strided memory access. QUInt16 remains 2.53x slower than FP32 despite optimizations.
-
-Through diagnostic profiling and code analysis, we've identified the exact cause of the 4.87x performance regression in vanilla uint16 quantization.
-
-### Evidence from Profiling
-
-**Profile Analysis Results** (`florence_v1_6_2_d3_tulrv6_multi_text_transformer_quint16_full_qdq_2026-01-06_22-27-14.json`):
-
-```
-QLinearMatMul operations: 11,445
-MatMul (FP32) fallbacks: 0
-Average time per QLinearMatMul: 1.3166ms
-Input types: uint16 activations × uint8 weights (CORRECT!)
-Execution Provider: CPUExecutionProvider
-```
-
-**Key Findings**:
-1. ✅ All 11,445 operations correctly use QLinearMatMul (no fallbacks)
-2. ✅ Correct data types (uint16 × uint8) are being used
-3. ✅ ARM64 NEON kernel IS being invoked
-4. ❌ **Performance is 1.9x SLOWER than FP32** (1.317ms vs 0.687ms per op)
-
-### The Smoking Gun
-
-**File**: `onnxruntime/core/mlas/lib/qgemm_u16u8.cpp`, lines 124-142
-
-```cpp
-// PERFORMANCE FIX: Pre-compute ALL row sums once (was being recomputed for every column tile)
-std::vector<int32_t> AllRowSums(M);
-for (size_t m = 0; m < M; m++) {
-    int32_t row_sum = 0;
-    for (size_t k = 0; k < K; k++) {
-        row_sum += static_cast<int32_t>(A[m * lda + k]);  // ❌ SCALAR LOOP!
-    }
-    AllRowSums[m] = row_sum;
-}
-
-// PERFORMANCE FIX: Pre-compute ALL column sums once (was being recomputed for every row tile)
-std::vector<int32_t> AllColumnSums(N);
-for (size_t n = 0; n < N; n++) {
-    int32_t col_sum = 0;
-    for (size_t k = 0; k < K; k++) {
-        col_sum += static_cast<int32_t>(B[k * ldb + n]);  // ❌ SCALAR LOOP!
-    }
-    AllColumnSums[n] = col_sum;
-}
-```
-
-### The Problem
-
-**For EVERY QLinearMatMul operation**, the dispatcher computes row and column sums using **slow scalar C++ code** to handle zero-point corrections. These sums are needed for the quantization formula:
-
-```
-(A - ZeroPointA) × (B - ZeroPointB) = A×B - A×ZeroPointB - B×ZeroPointA + ZeroPointA×ZeroPointB
-```
-
-The row and column sums compute `sum(A)` and `sum(B)` for the zero-point correction terms.
-
-### Performance Impact Analysis
-
-**Typical Florence MatMul dimensions**: M=77, K=768, N=768
-
-**Per-operation overhead**:
-- Row sum computation: `M × K = 77 × 768 = 59,136 scalar adds`
-- Column sum computation: `N × K = 768 × 768 = 589,824 scalar adds`
-- **Total**: `~649,000 scalar operations PER GEMM`
-
-**Model-wide impact** (11,445 QLinearMatMul operations):
-- **Total scalar operations**: `11,445 × 649,000 = 7.4 BILLION`
-- **Estimated overhead**: `7.4B ops / (3GHz CPU) ≈ 2.5 seconds` (actual ~8 seconds due to memory bandwidth)
-- This accounts for the majority of the `15,069ms` QLinearMatMul time!
-
-**Breakdown of 422ms inference time**:
-- Scalar sum computation: ~200ms (47% of runtime!)
-- Actual NEON GEMM kernels: ~100ms (24%)
-- ReduceMean (uint16, unoptimized): ~100ms (24%)
-- Other Q/DQ ops: ~22ms (5%)
-
 ### Why uint8×uint8 is Faster
 
 The QUInt8×QUInt8 implementation likely:
 1. Has optimized SIMD sum computation, or
-2. Uses a different quantization strategy that avoids per-operation sums, or
+2. Has a dedicated dispatcher and multithreaded handling
 3. Has pre-computed sums stored in the model
 
-### The Fix (Partially Implemented - 2026-01-08)
+### The Fix (Partially Implemented - 2026-01-10)
 
 **Vectorize sum computation using ARM64 NEON SIMD instructions**
 
-**Status Update**:
-
-1. **✅ Row sums (uint16 input) - IMPLEMENTED AND WORKING**
-   - Uses `vld1q_u16` to load 8 uint16 values at once
-   - Uses `vaddq_u32` to accumulate in 32-bit registers
-   - Processes K dimension in blocks of 8
-   - **Result**: ~8x speedup over scalar implementation
-   - See `ComputeRowSumNeon()` at qgemm_u16u8.cpp:50-100
-
-2. **❌ Column sums (uint8 input) - NEON DOES NOT HELP**
-   - NEON optimization was implemented (`ComputeColumnSumNeon()` at qgemm_u16u8.cpp:102-165)
-   - Testing showed NO performance improvement over scalar code
-   - **Root cause**: Strided memory access with large distances (ldb = 768+ bytes)
-   - Cache misses dominate, negating SIMD benefits
-   - **Decision**: Keep scalar code (intentional, not a bug)
-   - Column elements in row-major layout are non-contiguous: B[k*ldb + n]
-   - Each element is separated by `ldb` bytes (leading dimension)
-   - This causes cache line thrashing that prevents effective vectorization
-
-**Actual Performance Impact**:
-- Row sum optimization: ~50-100ms saved (estimated)
-- Column sum bottleneck: ~150-200ms overhead CANNOT be eliminated via SIMD
-- Total QLinearMatMul time: Still ~1.317ms per op (1.9x slower than FP32)
-- **Conclusion**: NEON alone cannot fix the QUInt16 performance issue
-
-**Remaining Performance Gap**:
-The QUInt16 kernel is fundamentally limited by:
-1. Column sum computation requires strided memory access (architectural limitation)
-2. uint16 data type may have worse cache behavior than uint8
-3. Possible additional inefficiencies in the GEMM kernel itself (under investigation)
 
 ### Implementation Status
 
@@ -636,67 +409,35 @@ The QUInt16 kernel is fundamentally limited by:
 
 **Completed**:
 1. ✅ NEON intrinsics includes (`<arm_neon.h>`) added
-2. ✅ Scalar row sum loop replaced with vectorized version (`ComputeRowSumNeon`)
-3. ❌ Column sum loop kept as scalar (NEON tested but doesn't help)
+2. ✅ Implemented Column-by-Column Packing Layout (BIsPacked)
 4. ✅ Correctness maintained for non-multiple-of-8 dimensions (tail handling)
 
 **Testing Completed**:
 1. ✅ Numerical correctness verified (sums match scalar version)
 2. ✅ Full Florence model evaluation performed
 3. ✅ Compared with FP32 and QUInt8 baselines
-4. ❌ Performance target not met (598ms vs 236ms FP32)
 
 ### Success Metrics
 
 **Target Performance** (after fix):
 - QLinearMatMul: < 0.5ms per operation (matching or beating FP32)
-- Total inference time: < 150ms (2.8x speedup, competitive with FP32)
+- Total inference time: < 100ms (competitive with dynquant)
 - **ACHIEVE PRIMARY MISSION**: Vanilla uint16 runs as fast as FP32!
 
 **Stretch Goal**:
 - QLinearMatMul: < 0.4ms per operation (better than FP32)
-- Total inference time: < 100ms (matching mixed no_adjust)
+- Total inference time: < 50ms (matching uint8 quantized model)
+
+**Full Analysis**: See `tools/python/perf_analysis/QUINT8_VS_QUINT16_ANALYSISOPTION_C_RESULTS.md`
 
 ### Current Status (2026-01-08)
 
-- [x] Profiling completed
-- [x] Root cause identified (scalar column sum computation)
-- [x] Performance impact quantified (~200ms overhead)
-- [x] NEON-accelerated row sum computation implemented and working
-- [x] NEON-accelerated column sum computation tested (does NOT help)
-- [x] Test and validation completed
-- [x] Benchmark comparison completed
-- [x] **ROOT CAUSE IDENTIFIED**: QUInt16 is 17.5x slower than QUInt8 (598ms vs 34ms)
-- [x] **Investigation completed**: See `runtime_analysis/QUINT8_VS_QUINT16_ANALYSIS.md`
-- [x] **OPTION A IMPLEMENTED**: Tile size optimization (StrideM: 4→24, StrideN: 16→128)
+- [x] Implemented NEON column sum computation (4 columns at once) → 127ms → 60-80ms
 - [x] **PERFORMANCE RESULT**: 4.72x speedup achieved (598ms → 127ms) ✅
 - [ ] **NEXT**: Optional - Implement Option B (vectorize column sums for additional 2x speedup)
 
-### Performance Gap Analysis: QUInt8 vs QUInt16
-
-**Full Analysis**: See `tools/python/perf_analysis/QUINT8_VS_QUINT16_ANALYSIS.md`
-
-**TL;DR** - Why WAS QUInt8 17.5x faster than QUInt16? (Now Fixed!)
-
-| Aspect | QUInt8×QUInt8 (55ms) | QUInt16×QUInt8 (BEFORE) | QUInt16×QUInt8 (AFTER) |
-|--------|----------------------|-------------------------|------------------------|
-| **Column Sums** | During **B packing** (sequential) | In **GEMM hot path** (strided) | Same (strided) |
-| **Tile Size** | 24 rows, 128 cols | 4 rows, 16 cols | **24 rows, 128 cols** ✅ |
-| **Iterations** | M/24 = 4 iterations | M/4 = 20 iterations | **M/24 = 4 iterations** ✅ |
-| **CPU Usage** | 76% (compute-bound) | 28% (memory-bound) | **77% (compute-bound)** ✅ |
-| **Performance** | 55ms | 598ms (10.9x slower) | **127ms (2.3x slower)** ✅ |
-
-**Root Cause** (identified): Small tile sizes (4 rows vs 24) caused excessive overhead recomputation.
-
-**Solution Implemented** (2026-01-08):
-- ✅ **Option A**: Increased tile sizes (StrideM: 4→24, StrideN: 16→128)
-- ✅ **Result**: **4.72x speedup** (598ms → 127ms)
-- ✅ **Status**: QUInt16 now production-ready for specific use cases
-
-**Remaining Gap**: Still 2.3x slower than QUInt8 (127ms vs 55ms) due to column sum architecture difference.
 
 **Further Optimization Options**:
-1. **Option B** (Medium, 2x): Vectorize column sum computation (4 columns at once) → 127ms → 60-80ms
 2. **Option C** (Optimal, 2-3x): Move column sums to B packing phase → 127ms → 50-60ms (match QUInt8)
 
 **Full Results**: See `tools/python/perf_analysis/TILE_SIZE_OPTIMIZATION_RESULTS.md`
@@ -763,92 +504,7 @@ Combine both scripts into a unified `quantize_and_evaluate_with_profiling.py` wi
   - `--warmup-runs` - Number of warmup runs
 - Integrated profiling and evaluation
 
-#### 3. Full Quantization Analysis Re-run
-Execute comprehensive benchmark comparing all approaches:
-
-```powershell
-# Run all quantization types with unified script
-.\run_quantization.ps1 -QuantType fp32
-.\run_quantization.ps1 -QuantType dynamic
-.\run_quantization.ps1 -QuantType quint8
-.\run_quantization.ps1 -QuantType quint16
-.\run_quantization.ps1 -QuantType mixed
-.\run_quantization.ps1 -QuantType mixed -UseLUT
-```
-
-Generate comprehensive comparison report including:
-- Performance metrics (mean, median, std, min, max)
-- Operator-level profiling breakdown
-- Model size comparison
-- Memory footprint analysis
-- Accuracy measurements (L2 error vs FP32)
-- Recommendations for production deployment
-
----
-
-## NEON Optimization Results (2026-01-06/07)
-
-### Summary
-
-Successfully implemented NEON-accelerated row sum computation for QUInt16×QUInt8 GEMM operations, achieving a **2.1x performance improvement** from the original implementation.
-
-### Performance Results
-
-| Configuration | Mean Time | Median Time | vs FP32 | vs Original | Status |
-|---------------|-----------|-------------|---------|-------------|--------|
-| **FP32 Baseline** | 54.9ms | 49.9ms | 1.0x | - | Reference |
-| **Original QUInt16 (scalar sums)** | ~422ms | - | 7.7x slower | baseline | ❌ |
-| **Broken NEON (row+column)** | 679ms | - | 12.4x slower | 1.6x WORSE | ❌ |
-| **Fixed QUInt16 (NEON row sum only)** | **198.3ms** | **193.5ms** | **3.6x slower** | **2.1x FASTER** | ✅ |
-
-### Implementation Details
-
-**File Modified**: `onnxruntime/core/mlas/lib/qgemm_u16u8.cpp`
-
-**What Works**:
-- ✅ **NEON Row Sum** (lines 50-100): Vectorized uint16 row sum using `vld1q_u16`, `vmovl_u16`, `vaddq_u32`
-  - Processes 8 elements per iteration
-  - Expected 8x speedup over scalar
-  - Contiguous memory access → excellent cache performance
-
-**What Doesn't Work**:
-- ❌ **NEON Column Sum** (attempted, reverted): Strided memory access pattern
-  - Accessing `B[k*768+n]` for each column = stride of 768 elements
-  - NEON overhead + manual packing > scalar performance
-  - Made performance 1.6x WORSE (679ms vs 422ms)
-  - **Reverted to scalar implementation**
-
-### Root Cause Analysis
-
-**Original Performance Breakdown** (422ms total):
-1. **Scalar row sums**: ~100ms (M × K operations = 77 × 768 = 59K operations per GEMM)
-2. **Scalar column sums**: ~100ms (N × K operations = 768 × 768 = 589K operations per GEMM)
-3. **Actual GEMM computation**: ~100ms (NEON kernel working correctly)
-4. **ReduceMean + other ops**: ~100ms (no uint16 optimization)
-5. **Q/DQ overhead**: ~22ms
-
-**After NEON Row Sum** (198ms total):
-1. **NEON row sums**: ~12-15ms (8x speedup) ✅
-2. **Scalar column sums**: ~100ms (unchanged - cache-unfriendly) ❌
-3. **Actual GEMM computation**: ~50-60ms (faster due to better cache state)
-4. **ReduceMean + other ops**: ~30ms
-5. **Q/DQ overhead**: ~8ms
-
-**Speedup Analysis**:
-- Row sum improvement: 100ms → 15ms = **85ms saved**
-- GEMM improvement: 100ms → 60ms = **40ms saved** (indirect benefit from better cache)
-- Total improvement: 422ms → 198ms = **224ms saved** (53% reduction) ✅
-
 ### Remaining Bottlenecks
-
-**1. Column Sum Computation (~100ms, 50% of runtime)**
-- **Problem**: Strided memory access (B[k*ldb+n]) causes cache misses
-- **Why NEON doesn't help**: Gathering scattered data into vectors adds overhead
-- **Possible solutions**:
-  - Transpose B matrix (one-time cost, makes columns contiguous)
-  - Compute column sums during GEMM kernel execution (amortize cost)
-  - Cache column sums across multiple GEMM operations
-  - Use different quantization strategy (avoid per-operation sums)
 
 **2. ReduceMean Operator (~30ms, 15% of runtime)**
 - **Problem**: No optimized uint16 kernel exists
@@ -877,17 +533,11 @@ Successfully implemented NEON-accelerated row sum computation for QUInt16×QUInt
 
 ### Current Status
 
-**PRIMARY MISSION**: Enable vanilla QDQ model with QUInt16×QUInt8 to **meet or outperform FP32 performance** on CPU without modifying the model
+**PRIMARY MISSION**: Enable vanilla QDQ model with QUInt16×QUInt8 to **meet or outperform FP32 performance** on CPU without modifying the model, stretch goal: meet uint8 quantization performance (<50ms).
 
 **Current Performance**:
 - FP32 Baseline: **54.9ms**
-- Vanilla QUInt16 (NEON optimized): **198ms** (3.6x slower)
-- **Gap to close**: 143ms (need 2.6x additional speedup)
-
-**Progress**:
-- ✅ **Phase 1 Complete**: Root cause identified, NEON row sum optimization (2.1x speedup)
-- ⚠️ **Phase 2 In Progress**: Close remaining performance gap
-- ❌ **Mission not yet achieved**: Need additional optimizations
+- Vanilla QUInt16 (NEON optimized): **127ms** (3.6x slower)
 
 ---
 
@@ -963,50 +613,11 @@ The analysis revealed **109 MatMul operations** in the quantized QDQ model file.
 5. **Priority 5**: Optimize quantization parameters for accuracy
 6. **Priority 6**: Implement per-channel quantization
 
-### ~~Priority 0: Investigate MatMul Fallbacks~~ ✅ RESOLVED
-
 **Status**: ✅ **RESOLVED** - Fusion is working correctly!
-
-**Investigation Results** (2026-01-07):
-- ✅ All 109 MatMul ops ARE successfully fused to QLinearMatMul with `ORT_ENABLE_EXTENDED`/`ORT_ENABLE_ALL`
-- ✅ QDQ transformer correctly recognizes uint16 DQ→MatMul→Q patterns
-- ✅ Schema validation is NOT blocking fusion
-- ✅ Q/DQ node count reduced by 34% (1,754 → 1,159 nodes) through fusion optimizations
-
-**Key Finding**: The 109 MatMul operations exist in the **QDQ model file** (before optimization) but ARE being fused to QLinearMatMul at **runtime** (during graph optimization). The earlier hypothesis about "FP32 MatMul fallbacks" was incorrect.
-
-**Implication**: The performance bottleneck is NOT a fusion issue - it's the **QLinearMatMul kernel performance** itself. Focus remains on:
-1. Optimizing column sum computation (~100ms)
-2. Implementing NEON ReduceMean for uint16 (~30ms)
-3. Optimizing Q/DQ kernels (~8ms)
-
-**Scripts Created**:
-- `analyze_u16u8_model_nodes.py` - Model structure analysis
-- `investigate_unfused_matmuls.py` - MatMul pattern analysis (identified all 109 as fusible)
-- `test_graph_optimization.py` - Verified fusion is working at runtime
 
 ### Priority 1: Performance Optimizations (Target: Match FP32 at 54.9ms)
 
 #### 1.1 Implement NEON-Optimized ReduceMean for uint16
-**Rationale**: Accounts for 20% of runtime (~30ms in optimized build)
-- Current: No optimized uint16 kernel (1.645ms per operation)
-- Target: Match FP32 performance using NEON SIMD
-- **Estimated Impact**: 20-25ms improvement (reduce from 30ms to 5-10ms)
-- **Complexity**: Medium
-- **Files**: `onnxruntime/core/providers/cpu/reduction/reduction_ops.cc`
-
-**Implementation approach**:
-- Use NEON `vaddq_u16` for parallel accumulation
-- Handle non-multiple-of-8 remainders
-- Vectorize across multiple dimensions (height, width, channels)
-
-#### 1.2 Optimize Column Sum Computation in QLinearMatMul
-**Rationale**: Accounts for 50% of runtime (~100ms)
-- Current: Scalar C++ loops with strided memory access
-- Target: Cache-friendly access pattern or kernel integration
-- **Estimated Impact**: 50-70ms improvement
-- **Complexity**: High
-- **Files**: `onnxruntime/core/mlas/lib/qgemm_u16u8.cpp`
 
 **Implementation approach**:
 - **Option A**: Transpose B matrix once (one-time cost, makes columns contiguous)
@@ -1028,6 +639,16 @@ The analysis revealed **109 MatMul operations** in the quantized QDQ model file.
 - Handle both scalar and per-channel quantization
 
 **Combined Estimated Impact**: 75-103ms improvement → **Target: 93-123ms total** (within range of FP32!)
+
+**Full Analysis**: See `tools/python/perf_analysis/OPTION_C_RESULTS.md`
+
+** Next steps: **
+
+  To achieve the target <100ms performance, we could proceed with Option A (threading + dispatcher integration):
+  - Expected additional speedup: 1.4-1.6x (163ms → 90-100ms)
+  - Benefits: Multi-core utilization, standard MLAS infrastructure
+  - Timeline: 4-5 days
+
 
 ### Priority 2: Graph Optimizations (Reduce Q/DQ Overhead)
 
@@ -1054,76 +675,13 @@ The analysis revealed **109 MatMul operations** in the quantized QDQ model file.
 **Complexity**: Medium-High
 **Files**: `onnxruntime/core/optimizer/qdq_transformer/selectors_actions/*`
 
-### Priority 3: Accuracy Improvements (Target: Match QUInt8 at 4.35e-03)
 
-#### 3.1 Optimize Quantization Parameters
-**Rationale**: Current L2 error 5.06e-02 is 11.6x worse than QUInt8 (4.35e-03)
-- Analyze scale factor distributions
-- Improve calibration method (MinMax → Percentile or Entropy)
-- Consider asymmetric vs symmetric quantization
-
-**Estimated Impact**: 2-5x improvement in accuracy
-**Complexity**: Medium
-**Files**: Quantization scripts, calibration data readers
-
-**Implementation approach**:
-- Use percentile-based calibration (e.g., 99.9th percentile) to handle outliers
-- Experiment with different calibration datasets
-- Analyze per-layer quantization errors
-
-#### 3.2 Implement Per-Channel Quantization for Weights
-**Rationale**: Can significantly improve accuracy with minimal performance cost
-- Current: Per-tensor quantization (single scale/zero-point for entire tensor)
-- Target: Per-channel quantization (separate scale/zero-point per output channel)
-
-**Estimated Impact**: 2-5x improvement in accuracy metrics
-**Complexity**: Medium
-**Files**: Quantization configuration, MLAS kernels
-
-**Implementation approach**:
-- Modify quantization config: `per_channel: true`
-- Ensure MLAS kernels support per-channel zero-points (already implemented)
-- Validate correctness and measure accuracy improvement
-
-#### 3.3 Selective Mixed-Precision for Accuracy-Critical Layers
-**Rationale**: Some layers may require higher precision than others
-- Identify layers with high quantization error
-- Use FP16 or uint16 for activations in those layers
-- Keep efficient uint8 for other layers
-
-**Estimated Impact**: Improve accuracy while maintaining performance
-**Complexity**: Medium-High
-**Files**: Quantization scripts with layer-specific overrides
-
-### Execution Plan
-
-**~~Phase 2.0: Fix Graph Fusion~~** ✅ **COMPLETED** - Fusion is working!
-1. ✅ **Day 1: Run model analysis** - COMPLETED (Found 109 MatMul ops in QDQ model)
-2. ✅ **Day 2: Investigate MatMul patterns** - COMPLETED (All 109 have correct DQ→MatMul→Q pattern)
-3. ✅ **Day 2: Verify runtime fusion** - COMPLETED (Confirmed all 109 MatMuls → QLinearMatMul with ORT_ENABLE_EXTENDED)
-
-**Result**: Fusion IS working correctly. The performance issue is kernel performance, not fusion failure.
-
-**Phase 2.1: Close Performance Gap** (Estimated: 2-3 weeks)
-1. 📅 Days 4-7: Implement NEON ReduceMean for uint16 (Priority 1.1)
-2. 📅 Days 8-12: Optimize column sum computation (Priority 1.2)
-3. 📅 Days 13-14: Implement NEON Q/DQ kernels (Priority 1.3)
-4. 📅 Days 15-16: Benchmark and validate performance improvements
-
-**Phase 2.2: Graph Optimizations** (Estimated: 1-2 weeks)
-1. 📅 Days 15-17: Implement Q/DQ roundtrip detection and elision (Priority 2.1)
-2. 📅 Days 18-20: Operator fusion for high-frequency patterns (Priority 2.2)
-3. 📅 Day 21: Benchmark and validate optimizations
-
-**Phase 2.3: Accuracy Improvements** (Estimated: 1-2 weeks)
-1. 📅 Days 22-24: Optimize quantization parameters (Priority 3.1)
-2. 📅 Days 25-27: Implement per-channel quantization (Priority 3.2)
-3. 📅 Day 28: Measure accuracy and compare with QUInt8 baseline
+**Phase 2: Accuracy Improvements** (Estimated: 1-2 weeks) --> see accuracy_improvement_plan.md
 
 **Success Criteria**:
 - ✅ **Performance**: Meet or outperform FP32 (≤54.9ms)
 - ✅ **Accuracy**: Match QUInt8 accuracy (≤4.35e-03 L2 error)
-- ✅ **Compatibility**: Vanilla QDQ model without modifications
+- ✅ **Compatibility**: Vanilla QDQ model without modifications, tested on embimg_c.quant.onnx
 
 ### Tracking and Documentation
 
@@ -1133,163 +691,15 @@ The analysis revealed **109 MatMul operations** in the quantized QDQ model file.
 
 ---
 
-## Session Summary: 2026-01-07
-
-### Completed Today
-
-1. ✅ **Model Structure Analysis** - Created and ran `analyze_u16u8_model_nodes.py`
-   - Identified 2,289 nodes in QDQ model with 25 unique configurations
-   - Found 109 MatMul operations in model file
-   - Detected 650 Q→DQ roundtrip patterns for potential optimization
-
-2. ✅ **MatMul Pattern Investigation** - Created `investigate_unfused_matmuls.py`
-   - Analyzed all 109 MatMul operations
-   - Confirmed ALL have correct DQ→MatMul→Q pattern for fusion
-   - Identified fusion blocker: "Unknown - should have been fused!" (misleading)
-
-3. ✅ **Graph Optimization Verification** - Created `test_graph_optimization.py`
-   - **KEY FINDING**: Fusion IS working correctly with ORT_ENABLE_EXTENDED/ALL
-   - All 109 MatMuls successfully fused to QLinearMatMul at runtime
-   - 34% reduction in Q/DQ nodes through fusion (1,754 → 1,159)
-
-4. ✅ **Root Cause Clarification** - Updated CLAUDE.md with corrected findings
-   - Performance issue is NOT fusion failure or FP32 fallbacks
-   - Problem is QLinearMatMul kernel performance:
-     - Column sum computation: ~100ms (50% of runtime)
-     - ReduceMean uint16: ~30ms (15% of runtime)
-     - Q/DQ operations: ~8ms (4% of runtime)
-
-### Key Insights
-
-**Before Today**: Suspected 109 MatMuls were falling back to FP32 due to fusion failure
-
-**After Investigation**:
-- ✅ Fusion is working perfectly (ORT_ENABLE_EXTENDED required)
-- ✅ uint16 NEON kernels ARE being invoked
-- ❌ Kernel performance needs optimization (column sums, ReduceMean, Q/DQ)
-
-### Next Steps
-
-**Priority Focus**: Kernel performance optimization (not fusion)
-1. **Days 3-6**: Implement NEON ReduceMean for uint16 (~30ms improvement)
-2. **Days 7-11**: Optimize column sum computation (~50-70ms improvement)
-3. **Days 12-13**: Implement NEON Q/DQ kernels (~8ms improvement)
-
-**Expected Result**: 90-110ms total improvement → **Target: 88-108ms** (meeting FP32 parity at 54.9ms!)
-
----
-
----
-
 ## Optimization Progress Summary (2026-01-07)
 
 ### Completed Optimizations ✅
 
 **1. NEON Row Sum Optimization** (2026-01-06)
-- **Impact**: 2.1x speedup (464ms → 198ms, 53% reduction)
-- **Files**: `onnxruntime/core/mlas/lib/qgemm_u16u8.cpp`
-- **Achievement**: Vectorized uint16 row sum computation using ARM NEON intrinsics
-- **Details**: See [FINAL_QUANTIZATION_COMPARISON.md](./FINAL_QUANTIZATION_COMPARISON.md#quint16-neon-optimization)
-
 **2. NEON ReduceMean Optimization** (2026-01-07)
-- **Impact**: 19.8% per-operation speedup (1.645ms → 1.320ms per op)
-- **Files**: `onnxruntime/core/providers/cpu/reduction/reduction_ops.{h,cc}`
-- **Achievement**: Full NEON specialization for `ReduceAggregatorMean<uint16_t>` with uint32 accumulators
-- **Overall Impact**: ~7ms per inference improvement (modest due to dominant QLinearMatMul bottleneck)
-- **Details**: See [FINAL_QUANTIZATION_COMPARISON.md](./FINAL_QUANTIZATION_COMPARISON.md#neon-reducemean-implementation-2026-01-07)
+**Details**: See [FINAL_QUANTIZATION_COMPARISON.md](./FINAL_QUANTIZATION_COMPARISON.md#neon-reducemean-implementation-2026-01-07)
 
 #### 3. NEON DequantizeLinear Optimization (2026-01-07)
-
 **Status**: ✅ **COMPLETED**
-
 - **Impact**: DequantizeLinear reduced from reference implementation to NEON-optimized
 - **Files**: `onnxruntime/core/mlas/lib/dequantize.cpp` (lines 329-412)
-- **Implementation**:
-  - Added `MlasDequantizeLinearU16Kernel()` for ARM64 NEON
-  - Processes 8×uint16 elements per iteration (vs 16×uint8 for uint8_t kernel)
-  - Uses `vld1q_u16`, `vsubq_u16`, `vmovl_s16`, `vcvtq_f32_s32`, `vmulq_f32` intrinsics
-  - Template specialization routes uint16_t to optimized kernel
-- **Performance**: 0.043 ms per operation (78,960 operations, 6.62% of total runtime)
-- **Note**: QuantizeLinear for uint16_t was already NEON-optimized using generic `MlasQuantizeLinearKernel<uint16_t>`
-
-### Current Performance Status
-
-**QUInt16 Vanilla Quantization** (latest benchmark with profiling - 2026-01-07):
-- **FP32 Baseline**: 114.254 ms
-- **QUInt16 Performance**: 505.995 ms (4.43x slower than FP32)
-- **Accuracy**: 5.072e-02 L2 error (similar to previous)
-- **Note**: Performance regression observed (505ms vs previous 385ms) - investigation needed
-
-**Performance Breakdown** (from profiled run):
-| Component | Total Time | Count | Avg/Op | % Runtime | Status |
-|-----------|-----------|-------|---------|-----------|--------|
-| QLinearMatMul | 19,835ms | 11,445 | 1.733ms | 38.4% | ❌ **Column sum bottleneck** |
-| ReduceMean | 9,302ms | 5,250 | 1.772ms | 18.0% | ✅ NEON optimized |
-| QuantizeLinear | 5,503ms | 42,735 | 0.129ms | 10.7% | ✅ NEON optimized |
-| Add | 4,651ms | 20,475 | 0.227ms | 9.0% | - |
-| Transpose | 3,838ms | 5,040 | 0.762ms | 7.4% | - |
-| DequantizeLinear | 3,422ms | 78,960 | 0.043ms | 6.6% | ✅ **NEON optimized** |
-
-### Outstanding Optimizations (Priority Order)
-
-**Priority 1: Column Sum Vectorization**
-- **Location**: `onnxruntime/core/mlas/lib/qgemm_u16u8.cpp`
-- **Problem**: Scalar loops with strided memory access for B matrix column sums
-- **Current Impact**: QLinearMatMul @ 1.733ms per operation (38.4% of total runtime)
-- **Expected**: Reduce to ~0.5-0.7ms per operation (matching or beating FP32 Gemm)
-- **Target Improvement**: 150-200ms reduction in total inference time
-- **Approaches**:
-  1. Transpose B matrix once (convert columns to contiguous rows) - simplest
-  2. Compute sums inside GEMM kernel (amortize across tiles) - most efficient
-  3. Use NEON gather instructions for strided access - complex
-- **Challenge**: Strided access makes naive NEON vectorization difficult
-- **Status**: High priority, highest potential impact
-
-**Priority 2: Graph Optimization (Q→DQ Roundtrips)**
-- **Location**: `onnxruntime/core/optimizer/qdq_transformer/*`
-- **Current Impact**: Large number of Q/DQ pairs (42,735 QuantizeLinear + 78,960 DequantizeLinear)
-- **Target**: 10-20ms improvement through pattern elimination
-- **Approach**: Implement direct type conversion or bypass unnecessary roundtrips
-- **Status**: Lower priority now that Q/DQ operations are NEON-optimized
-
-**Priority 3: Investigate Performance Regression**
-- **Problem**: Performance degraded from 385ms (previous) to 506ms (current)
-- **Possible Causes**:
-  1. Profiling overhead (--enable-profiling flag adds measurement cost)
-  2. Lost optimization from previous builds
-  3. Different test conditions or model version
-- **Action**: Run benchmark without profiling to establish true baseline
-
-### Realistic Performance Targets
-
-**After Remaining Optimizations** (starting from 506ms baseline):
-- Column sum optimization: 506ms → ~250-300ms (expected 150-200ms reduction)
-- Graph optimizations: ~250-300ms → ~230-280ms (expected 10-20ms reduction)
-- **Final Target**: ~230-280ms (2.0-2.5x slower than FP32)
-
-**Progress Summary**:
-- ✅ NEON Row Sum Optimization: 2.1x speedup achieved
-- ✅ NEON ReduceMean: 19.8% per-op improvement
-- ✅ NEON DequantizeLinear: Optimized to 0.043ms per op
-- ✅ NEON QuantizeLinear: Already optimized (generic kernel)
-- ⏳ Column Sum Vectorization: Largest remaining bottleneck (38.4% of runtime)
-
-**FP32 Parity Assessment**: Unlikely even with all optimizations. Vanilla QUInt16 will likely remain 2.0-2.5x slower than FP32 due to inherent quantization correction overhead (zero-point adjustments, scaling).
-
-### Recommendation
-
-**For Production Use**: Prefer **Mixed-Precision** quantization (QUInt16 MatMul activations + QUInt8 everything else)
-- Performance: 66ms (1.7x faster than FP32)
-- Accuracy: Same as QUInt8 (4.35e-03 L2 error)
-- See [MIXED_PRECISION_RESULTS.md](./MIXED_PRECISION_RESULTS.md)
-
-**For Research/Development**: Continue QUInt16 vanilla optimization to:
-- Demonstrate ONNX Runtime kernel optimization techniques
-- Benchmark maximum achievable performance for uint16 quantization
-- Establish performance baselines for future hardware (e.g., with native uint16 GEMM)
-
----
-
-**Last Updated**: 2026-01-07 (Evening session)
-**Current Phase**: NEON Q/DQ optimization complete, investigating performance regression
-**Status**: 3/5 major optimizations complete (Row Sum, ReduceMean, DequantizeLinear), 4.4x slower than FP32
