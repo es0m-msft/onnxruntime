@@ -515,12 +515,43 @@ Return Value:
                     RowSumBuffer[mm] = AllRowSums[m + mm];
                 }
 
+                // PERFORMANCE OPTIMIZATION: Prefetch next M-block's A matrix data
+                if (m_block + 1 < m_block_end) {
+                    const size_t next_m = (m_block + 1) * StrideM;
+                    if (next_m < M) {
+                        // Prefetch first few cache lines of next M-block
+                        const uint16_t* next_A = A + next_m * lda;
+#if defined(_MSC_VER)
+                        __prefetch(next_A);  // MSVC ARM64 intrinsic
+                        __prefetch(reinterpret_cast<const char*>(next_A) + 64);
+#else
+                        __builtin_prefetch(next_A, 0, 3);  // GCC/Clang intrinsic
+                        __builtin_prefetch(next_A + 64, 0, 3);
+#endif
+                    }
+                }
+
                 for (size_t n = 0; n < N; n += StrideN) {
                     const size_t CountN = std::min(N - n, StrideN);
 
                     // Copy pre-computed column sums for this tile
                     for (size_t nn = 0; nn < CountN; nn++) {
                         ColumnSumBuffer[nn] = AllColumnSums[n + nn];
+                    }
+
+                    // PERFORMANCE OPTIMIZATION: Prefetch next N-tile's packed B matrix data
+                    if (n + StrideN < N) {
+                        const size_t next_n = n + StrideN;
+                        const uint8_t* next_PackedB = PackedB + next_n * K;
+#if defined(_MSC_VER)
+                        __prefetch(next_PackedB);  // MSVC ARM64 intrinsic
+                        __prefetch(next_PackedB + 64);
+                        __prefetch(next_PackedB + 128);
+#else
+                        __builtin_prefetch(next_PackedB, 0, 3);  // GCC/Clang intrinsic
+                        __builtin_prefetch(next_PackedB + 64, 0, 3);
+                        __builtin_prefetch(next_PackedB + 128, 0, 3);
+#endif
                     }
 
                     // Setup zero point B buffer
