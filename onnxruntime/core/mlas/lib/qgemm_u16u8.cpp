@@ -294,14 +294,30 @@ Return Value:
 {
 #if defined(MLAS_TARGET_ARM64) || defined(MLAS_TARGET_ARM64EC)
 
-    // ThreadPool is reserved for future parallel implementation
-    MLAS_UNREFERENCED_PARAMETER(ThreadPool);
-
     const size_t M = Shape.M;
     const size_t N = Shape.N;
     const size_t K = Shape.K;
 
-    // Process each batch
+    // PERFORMANCE OPTIMIZATION (2026-01-10 - Option A): Threading support
+    // Tile sizes for work partitioning
+    constexpr size_t StrideM = 24;  // Process 24 rows at a time
+    constexpr size_t StrideN = 128; // Process 128 columns at a time
+    constexpr size_t PackedK = 8;   // K dimension packing
+
+    // Calculate work partitioning
+    const size_t BlockedM = (M + StrideM - 1) / StrideM;
+
+    // Determine threading strategy: partition along M dimension
+    // (typical case: M << N, so partitioning M gives better load balance)
+    ptrdiff_t ThreadsPerGemm = static_cast<ptrdiff_t>(BlockedM);
+    const ptrdiff_t MaxThreads = MlasGetMaximumThreadCount(ThreadPool);
+    if (ThreadsPerGemm > MaxThreads) {
+        ThreadsPerGemm = MaxThreads;
+    }
+
+    const size_t PackedCountK = (K + PackedK - 1) / PackedK;
+
+    // Process each batch sequentially (packing and column sums must be done once per batch)
     for (size_t batch = 0; batch < BatchN; batch++) {
         const auto* params = &DataParams[batch];
 
@@ -317,25 +333,6 @@ Return Value:
         const uint8_t* ZeroPointBPtr = params->ZeroPointB;
         const bool PerColumnZeroPoints = params->PerColumnZeroPoints;
         const bool BIsPacked = params->BIsPacked;
-
-        // Allocate temporary buffers for row/column sums
-        // These are used to compute the zero-point corrections:
-        // (A - ZeroPointA) * (B - ZeroPointB) = A*B - A*ZeroPointB - B*ZeroPointA + ZeroPointA*ZeroPointB
-
-        // PERFORMANCE OPTIMIZATION (2026-01-08): Increased tile sizes to match QUInt8 approach
-        // This reduces the number of tile iterations and amortizes column sum computation overhead
-        // Previous: StrideM=4 resulted in M/4 iterations (e.g., 77/4 = 20 iterations)
-        // Current: StrideM=24 results in M/24 iterations (e.g., 77/24 = 4 iterations)
-        // Expected speedup: 2-3x due to reduced overhead
-        constexpr size_t StrideM = 24;  // Process 24 rows at a time (increased from 4, matches QUInt8)
-        constexpr size_t StrideN = 128; // Process 128 columns at a time (increased from 16, matches QUInt8)
-        constexpr size_t PackedK = 8;   // K dimension packing (8 elements per block)
-
-        const size_t PackedCountK = (K + PackedK - 1) / PackedK;
-
-        std::vector<int32_t> RowSumBuffer(StrideM);
-        std::vector<int32_t> ColumnSumBuffer(StrideN);
-        std::vector<int32_t> ZeroPointBBuffer(StrideN);
 
         // PERFORMANCE FIX: Pre-compute ALL row sums once using NEON SIMD instructions
         // This is ~8x faster than the original scalar implementation
@@ -399,98 +396,113 @@ Return Value:
             PackedB = PackedBBuffer.data();
         }
 
-        // Process in tiles
-        for (size_t m = 0; m < M; m += StrideM) {
-            const size_t CountM = std::min(M - m, StrideM);
+        // PERFORMANCE OPTIMIZATION (2026-01-10 - Option A): Parallel tile processing
+        // Partition work along M dimension: each thread processes a range of rows
+        MlasTrySimpleParallel(ThreadPool, ThreadsPerGemm, [&](ptrdiff_t thread_id) {
+            // Calculate M range for this thread
+            const size_t RowsPerThread = (BlockedM + ThreadsPerGemm - 1) / ThreadsPerGemm;
+            const size_t m_block_start = thread_id * RowsPerThread;
+            const size_t m_block_end = std::min(m_block_start + RowsPerThread, BlockedM);
 
-            // Copy pre-computed row sums for this tile
-            for (size_t mm = 0; mm < CountM; mm++) {
-                RowSumBuffer[mm] = AllRowSums[m + mm];
-            }
+            // Thread-local buffers for tile processing
+            std::vector<int32_t> RowSumBuffer(StrideM);
+            std::vector<int32_t> ColumnSumBuffer(StrideN);
+            std::vector<int32_t> ZeroPointBBuffer(StrideN);
 
-            for (size_t n = 0; n < N; n += StrideN) {
-                const size_t CountN = std::min(N - n, StrideN);
+            // Process tiles for this thread's M range
+            for (size_t m_block = m_block_start; m_block < m_block_end; m_block++) {
+                const size_t m = m_block * StrideM;
+                const size_t CountM = std::min(M - m, StrideM);
 
-                // Copy pre-computed column sums for this tile
-                for (size_t nn = 0; nn < CountN; nn++) {
-                    ColumnSumBuffer[nn] = AllColumnSums[n + nn];
+                // Copy pre-computed row sums for this tile
+                for (size_t mm = 0; mm < CountM; mm++) {
+                    RowSumBuffer[mm] = AllRowSums[m + mm];
                 }
 
-                // Setup zero point B buffer
-                const int32_t* ZeroPointBParam = nullptr;
-                if (ZeroPointBPtr != nullptr) {
-                    if (PerColumnZeroPoints) {
-                        for (size_t nn = 0; nn < CountN; nn++) {
-                            ZeroPointBBuffer[nn] = -static_cast<int32_t>(ZeroPointBPtr[n + nn]);
-                        }
-                        ZeroPointBParam = ZeroPointBBuffer.data();
-                    } else {
-                        const int32_t zpb = -static_cast<int32_t>(ZeroPointBPtr[0]);
-                        std::fill(ZeroPointBBuffer.begin(), ZeroPointBBuffer.begin() + CountN, zpb);
-                        ZeroPointBParam = ZeroPointBBuffer.data();
+                for (size_t n = 0; n < N; n += StrideN) {
+                    const size_t CountN = std::min(N - n, StrideN);
+
+                    // Copy pre-computed column sums for this tile
+                    for (size_t nn = 0; nn < CountN; nn++) {
+                        ColumnSumBuffer[nn] = AllColumnSums[n + nn];
                     }
-                }
 
-                // Apply zero point corrections to column sums
-                for (size_t nn = 0; nn < CountN; nn++) {
-                    ColumnSumBuffer[nn] = -ColumnSumBuffer[nn] * ZeroPointA;
-                }
-
-                // Apply zero point B correction to row sums
-                if (ZeroPointBPtr != nullptr) {
-                    for (size_t mm = 0; mm < CountM; mm++) {
+                    // Setup zero point B buffer
+                    const int32_t* ZeroPointBParam = nullptr;
+                    if (ZeroPointBPtr != nullptr) {
                         if (PerColumnZeroPoints) {
-                            // Will be handled inside kernel
-                            RowSumBuffer[mm] -= static_cast<int32_t>(K) * ZeroPointA;
+                            for (size_t nn = 0; nn < CountN; nn++) {
+                                ZeroPointBBuffer[nn] = -static_cast<int32_t>(ZeroPointBPtr[n + nn]);
+                            }
+                            ZeroPointBParam = ZeroPointBBuffer.data();
                         } else {
-                            const int32_t zpb = static_cast<int32_t>(ZeroPointBPtr[0]);
-                            RowSumBuffer[mm] = -RowSumBuffer[mm] * zpb
-                                             - static_cast<int32_t>(K) * ZeroPointA;
+                            const int32_t zpb = -static_cast<int32_t>(ZeroPointBPtr[0]);
+                            std::fill(ZeroPointBBuffer.begin(), ZeroPointBBuffer.begin() + CountN, zpb);
+                            ZeroPointBParam = ZeroPointBBuffer.data();
                         }
                     }
-                } else {
-                    for (size_t mm = 0; mm < CountM; mm++) {
-                        RowSumBuffer[mm] -= static_cast<int32_t>(K) * ZeroPointA;
+
+                    // Apply zero point corrections to column sums
+                    for (size_t nn = 0; nn < CountN; nn++) {
+                        ColumnSumBuffer[nn] = -ColumnSumBuffer[nn] * ZeroPointA;
                     }
-                }
 
-                // Call the ARM64 NEON kernel with packed B matrix
-                bool ZeroMode = true; // Always write, don't accumulate
+                    // Apply zero point B correction to row sums
+                    if (ZeroPointBPtr != nullptr) {
+                        for (size_t mm = 0; mm < CountM; mm++) {
+                            if (PerColumnZeroPoints) {
+                                // Will be handled inside kernel
+                                RowSumBuffer[mm] -= static_cast<int32_t>(K) * ZeroPointA;
+                            } else {
+                                const int32_t zpb = static_cast<int32_t>(ZeroPointBPtr[0]);
+                                RowSumBuffer[mm] = -RowSumBuffer[mm] * zpb
+                                                 - static_cast<int32_t>(K) * ZeroPointA;
+                            }
+                        }
+                    } else {
+                        for (size_t mm = 0; mm < CountM; mm++) {
+                            RowSumBuffer[mm] -= static_cast<int32_t>(K) * ZeroPointA;
+                        }
+                    }
 
-                size_t RowsHandled = MlasGemmU16U8KernelNeon(
-                    A + m * lda,
-                    PackedB + n * K,  // Use packed B (column-by-column contiguous layout)
-                    C + m * ldc + n,
-                    PackedCountK,
-                    CountM,
-                    CountN,
-                    ldc,
-                    RowSumBuffer.data(),
-                    ColumnSumBuffer.data(),
-                    ZeroPointBParam,
-                    ZeroMode
-                );
+                    // Call the ARM64 NEON kernel with packed B matrix
+                    bool ZeroMode = true; // Always write, don't accumulate
 
-                // Ignore RowsHandled - kernel always processes 4 rows minimum
-                // Use CountM (actual row count) for post-processing
-                (void)RowsHandled;
-
-                // Apply output post-processing if specified
-                // BUGFIX (2026-01-09): Use CountM instead of RowsHandled to avoid buffer overrun
-                // The kernel always processes 4 rows minimum, but we may have fewer rows in the last tile
-                if (params->OutputProcessor != nullptr) {
-                    params->OutputProcessor->Process(
-                        C,
-                        m,
-                        n,
-                        CountM,  // FIXED: Use actual row count, not kernel's RowsHandled
+                    size_t RowsHandled = MlasGemmU16U8KernelNeon(
+                        A + m * lda,
+                        PackedB + n * K,  // Use packed B (column-by-column contiguous layout)
+                        C + m * ldc + n,
+                        PackedCountK,
+                        CountM,
                         CountN,
-                        ldc
+                        ldc,
+                        RowSumBuffer.data(),
+                        ColumnSumBuffer.data(),
+                        ZeroPointBParam,
+                        ZeroMode
                     );
-                }
-            }
-        }
-    }
+
+                    // Ignore RowsHandled - kernel always processes 4 rows minimum
+                    // Use CountM (actual row count) for post-processing
+                    (void)RowsHandled;
+
+                    // Apply output post-processing if specified
+                    // BUGFIX (2026-01-09): Use CountM instead of RowsHandled to avoid buffer overrun
+                    // The kernel always processes 4 rows minimum, but we may have fewer rows in the last tile
+                    if (params->OutputProcessor != nullptr) {
+                        params->OutputProcessor->Process(
+                            C,
+                            m,
+                            n,
+                            CountM,  // FIXED: Use actual row count, not kernel's RowsHandled
+                            CountN,
+                            ldc
+                        );
+                    }
+                }  // end n loop
+            }  // end m_block loop
+        });  // end MlasTrySimpleParallel
+    }  // end batch loop
 
 #else
     // U16U8 GEMM is currently only implemented for ARM64
