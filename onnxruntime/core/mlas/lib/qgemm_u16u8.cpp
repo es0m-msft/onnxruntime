@@ -412,7 +412,7 @@ Return Value:
     const size_t K = Shape.K;
 
     // PERFORMANCE OPTIMIZATION (2026-01-10 - Option A): Threading support
-    // Tile sizes for work partitioning
+    // Tile sizes for work partitioning (Baseline: StrideM=24, StrideN=128 - OPTIMAL)
     constexpr size_t StrideM = 24;  // Process 24 rows at a time
     constexpr size_t StrideN = 128; // Process 128 columns at a time
     constexpr size_t PackedK = 8;   // K dimension packing
