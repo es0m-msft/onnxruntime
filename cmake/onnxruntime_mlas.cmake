@@ -215,11 +215,14 @@ function(setup_mlas_source_for_windows)
       ${MLAS_SRC_DIR}/sqnbitgemm_kernel_avx2.cpp
       ${MLAS_SRC_DIR}/sqnbitgemm_kernel_avx512.cpp
       ${MLAS_SRC_DIR}/sqnbitgemm_kernel_avx512vnni.cpp
+      ${MLAS_SRC_DIR}/qgemm_u16u8.cpp
       ${MLAS_SRC_DIR}/amd64/QgemmU8S8KernelAmx.asm
       ${MLAS_SRC_DIR}/amd64/QgemmU8S8KernelAvx2.asm
       ${MLAS_SRC_DIR}/amd64/QgemmU8U8KernelAvx2.asm
       ${MLAS_SRC_DIR}/amd64/QgemmU8X8KernelAvx2.asm
       ${MLAS_SRC_DIR}/amd64/QgemmU8X8KernelAvx512Core.asm
+      ${MLAS_SRC_DIR}/amd64/QgemmU16U8KernelAvx2.asm
+      ${MLAS_SRC_DIR}/amd64/QgemmU16U8KernelAvx512Core.asm
       ${MLAS_SRC_DIR}/amd64/QgemvU8S8KernelAvx2.asm
       ${MLAS_SRC_DIR}/amd64/QgemvU8S8KernelAvx512Core.asm
       ${MLAS_SRC_DIR}/amd64/QgemvU8S8KernelAvx512Vnni.asm
