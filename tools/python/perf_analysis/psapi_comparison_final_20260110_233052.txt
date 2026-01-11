@@ -1,0 +1,180 @@
+================================================================================
+ONNX Runtime Performance Comparison Report
+================================================================================
+
+Generated: 2026-01-10 23:30:52
+Runs per model: 20
+Cooldown period: 30s
+
+Build Directories:
+  Build 1: C:/d/onnxruntime/build_arm64_u16u8/Release/Release
+  Build 2: C:/d/tmp/onnxruntime.qnn-windows-v143-arm64-Release.10.5.3-main/runtimes/win-arm64/native
+
+Model Directory: C:/d/models/psapi_common_2_0_214985
+
+================================================================================
+
+Model: PSA1
+--------------------------------------------------------------------------------
+
+Build                        Avg(ms)   Median(ms)    P90(ms)   CPU(%)    Min(ms)    Max(ms)
+-----------------------------------------------------------------------------------------------
+Build1_Release                381.56       372.90     458.12       78     313.13     458.97
+Build2_win-arm64              332.01       330.74     368.60       82     264.96     394.13
+
+Fastest: Build2_win-arm64 (332.01ms)
+Relative Performance:
+  Build2_win-arm64: 1.00x (baseline)
+  Build1_Release: 1.15x slower (49.54ms slower)
+
+================================================================================
+
+Model: PSA2
+--------------------------------------------------------------------------------
+
+Build                        Avg(ms)   Median(ms)    P90(ms)   CPU(%)    Min(ms)    Max(ms)
+-----------------------------------------------------------------------------------------------
+Build1_Release                532.76       501.09     654.40       69     453.49     930.85
+Build2_win-arm64              955.73       951.49    1052.18       65     821.35    1103.26
+
+Fastest: Build1_Release (532.76ms)
+Relative Performance:
+  Build1_Release: 1.00x (baseline)
+  Build2_win-arm64: 1.79x slower (422.98ms slower)
+
+================================================================================
+
+Model: PSF
+--------------------------------------------------------------------------------
+
+Build                        Avg(ms)   Median(ms)    P90(ms)   CPU(%)    Min(ms)    Max(ms)
+-----------------------------------------------------------------------------------------------
+Build1_Release                119.30       113.36     180.67       80      74.39     203.96
+Build2_win-arm64              118.26       102.59     173.77       83      71.67     211.24
+
+Fastest: Build2_win-arm64 (118.26ms)
+Relative Performance:
+  Build2_win-arm64: 1.00x (baseline)
+  Build1_Release: 1.01x slower (1.04ms slower)
+
+================================================================================
+
+Model: PSH
+--------------------------------------------------------------------------------
+
+Build                        Avg(ms)   Median(ms)    P90(ms)   CPU(%)    Min(ms)    Max(ms)
+-----------------------------------------------------------------------------------------------
+Build1_Release                109.88       100.94     181.02       78      67.94     200.67
+Build2_win-arm64              340.58       356.08     490.14       73     121.02     521.50
+
+Fastest: Build1_Release (109.88ms)
+Relative Performance:
+  Build1_Release: 1.00x (baseline)
+  Build2_win-arm64: 3.10x slower (230.71ms slower)
+
+================================================================================
+
+Model: PSI
+--------------------------------------------------------------------------------
+
+Build                        Avg(ms)   Median(ms)    P90(ms)   CPU(%)    Min(ms)    Max(ms)
+-----------------------------------------------------------------------------------------------
+Build1_Release                192.99       205.48     293.32       73      91.56     320.77
+Build2_win-arm64              424.41       428.86     604.46       72     247.41     612.91
+
+Fastest: Build1_Release (192.99ms)
+Relative Performance:
+  Build1_Release: 1.00x (baseline)
+  Build2_win-arm64: 2.20x slower (231.42ms slower)
+
+================================================================================
+
+Model: PSJ
+--------------------------------------------------------------------------------
+
+Build                        Avg(ms)   Median(ms)    P90(ms)   CPU(%)    Min(ms)    Max(ms)
+-----------------------------------------------------------------------------------------------
+Build1_Release                 34.47        27.31      66.65       79      16.89      93.28
+Build2_win-arm64               98.36        96.24     130.33       84      67.68     139.25
+
+Fastest: Build1_Release (34.47ms)
+Relative Performance:
+  Build1_Release: 1.00x (baseline)
+  Build2_win-arm64: 2.85x slower (63.89ms slower)
+
+================================================================================
+
+Model: PSL
+--------------------------------------------------------------------------------
+
+Build                        Avg(ms)   Median(ms)    P90(ms)   CPU(%)    Min(ms)    Max(ms)
+-----------------------------------------------------------------------------------------------
+Build1_Release                341.19       350.44     571.72       78     189.71     617.56
+Build2_win-arm64             1057.48      1169.12    1358.95       70     519.22    1433.88
+
+Fastest: Build1_Release (341.19ms)
+Relative Performance:
+  Build1_Release: 1.00x (baseline)
+  Build2_win-arm64: 3.10x slower (716.29ms slower)
+
+================================================================================
+
+Model: PSP1
+--------------------------------------------------------------------------------
+
+Build                        Avg(ms)   Median(ms)    P90(ms)   CPU(%)    Min(ms)    Max(ms)
+-----------------------------------------------------------------------------------------------
+Build1_Release               2472.93      2466.04    2710.64       62    1996.49    2761.93
+Build2_win-arm64             3394.68      3371.04    3789.61       66    2917.31    3793.86
+
+Fastest: Build1_Release (2472.93ms)
+Relative Performance:
+  Build1_Release: 1.00x (baseline)
+  Build2_win-arm64: 1.37x slower (921.75ms slower)
+
+================================================================================
+
+Model: PSV
+--------------------------------------------------------------------------------
+
+Build                        Avg(ms)   Median(ms)    P90(ms)   CPU(%)    Min(ms)    Max(ms)
+-----------------------------------------------------------------------------------------------
+Build1_Release                 64.18        61.62      85.01       79      42.66     105.69
+Build2_win-arm64              108.51       104.95     156.78       70      74.60     166.57
+
+Fastest: Build1_Release (64.18ms)
+Relative Performance:
+  Build1_Release: 1.00x (baseline)
+  Build2_win-arm64: 1.69x slower (44.33ms slower)
+
+================================================================================
+
+Model: PSW
+--------------------------------------------------------------------------------
+
+Build                        Avg(ms)   Median(ms)    P90(ms)   CPU(%)    Min(ms)    Max(ms)
+-----------------------------------------------------------------------------------------------
+Build1_Release                 30.96        28.47      45.01       85      20.93      46.16
+Build2_win-arm64              100.91        94.04     171.82       82      56.41     181.91
+
+Fastest: Build1_Release (30.96ms)
+Relative Performance:
+  Build1_Release: 1.00x (baseline)
+  Build2_win-arm64: 3.26x slower (69.96ms slower)
+
+================================================================================
+
+OVERALL SUMMARY
+================================================================================
+
+Average Performance Across All Models:
+
+Build                        Avg Latency(ms)   Median Latency(ms)
+-----------------------------------------------------------------
+Build1_Release                        428.02               192.99
+Build2_win-arm64                      693.09               340.58
+
+Overall Fastest: Build1_Release (428.02ms avg)
+Overall Relative Performance:
+  Build1_Release: 1.00x (baseline)
+  Build2_win-arm64: 1.62x slower
