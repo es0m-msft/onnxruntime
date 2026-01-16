@@ -125,7 +125,7 @@ Status QLinearMatMul::Compute(OpKernelContext* ctx) const {
 
   // Handle QUInt16 × QUInt8 mixed precision separately
   if (is_u16u8) {
-#if defined(MLAS_TARGET_ARM64) || defined(MLAS_TARGET_ARM64EC)
+#if defined(MLAS_TARGET_ARM64) || defined(MLAS_TARGET_ARM64EC) || defined(MLAS_TARGET_AMD64)
     MatMulComputeHelper helper;
     if (nullptr != b) {
       ORT_RETURN_IF_ERROR(helper.Compute(a->Shape(), b->Shape(), &b_scale->Shape(), &b_offset->Shape()));
@@ -198,7 +198,7 @@ Status QLinearMatMul::Compute(OpKernelContext* ctx) const {
 
     return Status::OK();
 #else
-    return ORT_MAKE_STATUS(ONNXRUNTIME, FAIL, "QUInt16 × QUInt8 QLinearMatMul is only supported on ARM64");
+    return ORT_MAKE_STATUS(ONNXRUNTIME, FAIL, "QUInt16 × QUInt8 QLinearMatMul is only supported on ARM64 and x64");
 #endif
   }
 
